@@ -12,8 +12,7 @@
   <PropertyGroup>
     <!-- Override signing key to match the consuming repo's build-common submodule -->
     <AssemblyOriginatorKeyFile>$(MSBuildThisFileDirectory)..\..\..\..\build-common\avalonia.snk</AssemblyOriginatorKeyFile>
-    <!-- The submodule's MicroBuild targets convert DelaySign→PublicSign which produces
-         a zeroed signature blob that .NET Framework rejects at runtime. Force full signing. -->
+    <!-- Force full signing so .NET Framework can load the assembly at runtime. -->
     <DelaySign>false</DelaySign>
     <PublicSign>false</PublicSign>
     <GeneratePackageOnBuild>false</GeneratePackageOnBuild>
