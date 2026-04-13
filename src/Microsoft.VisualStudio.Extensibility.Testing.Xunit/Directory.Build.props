@@ -1,0 +1,21 @@
+<Project>
+  <!--
+    This file is a local override for the consuming repo (AvaloniaUI.DeveloperSuite).
+    It is NOT tracked by the vs-extension-testing submodule.
+    It re-signs the assembly with the consuming repo's key so that
+    strongly-named integration test assemblies can load it at runtime.
+  -->
+
+  <!-- Import the submodule's own build props so we don't lose its configuration -->
+  <Import Project="$(MSBuildThisFileDirectory)..\Directory.Build.props" />
+
+  <PropertyGroup>
+    <!-- Override signing key to match the consuming repo's build-common submodule -->
+    <AssemblyOriginatorKeyFile>$(MSBuildThisFileDirectory)..\..\..\..\build-common\avalonia.snk</AssemblyOriginatorKeyFile>
+    <!-- The submodule's MicroBuild targets convert DelaySign→PublicSign which produces
+         a zeroed signature blob that .NET Framework rejects at runtime. Force full signing. -->
+    <DelaySign>false</DelaySign>
+    <PublicSign>false</PublicSign>
+    <GeneratePackageOnBuild>false</GeneratePackageOnBuild>
+  </PropertyGroup>
+</Project>
