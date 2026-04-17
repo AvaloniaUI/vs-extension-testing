@@ -48,6 +48,10 @@ namespace Xunit.Harness
         {
             var result = new RunSummary();
             var completedTestCaseIds = new HashSet<string>();
+
+            // Tests known to have crashed the VS instance while they were in-flight on a prior attempt.
+            // On retry we push these to the end of the batch so a crash doesn't take down tests queued behind them.
+            var suspectCrashingTestCaseIds = new HashSet<string>();
             try
             {
                 // Handle [Fact], and also handle IdeSkippedDataRowTestCase that doesn't run inside Visual Studio
@@ -68,18 +72,40 @@ namespace Xunit.Harness
 
                     for (var currentAttempt = 0; currentAttempt < testCasesByTargetVersion.Key.MaxAttempts; currentAttempt++)
                     {
+                        // On retry attempts, exclude tests known to have crashed VS on a prior attempt - xUnit's
+                        // default class-level test ordering is alphabetical, so an IEnumerable reorder is not enough.
+                        // Suspects are run in isolation (one VS instance each) after the main retry loop completes.
+                        var testsForThisAttempt = currentAttempt > 0 && suspectCrashingTestCaseIds.Count > 0
+                            ? currentTests.Where(test => !suspectCrashingTestCaseIds.Contains(test.UniqueID)).ToArray()
+                            : currentTests;
+
+                        if (testsForThisAttempt.Length > 0)
+                        {
+                            using var marshalledObjects = new MarshalledObjects();
+                            using var visualStudioInstanceFactory = new VisualStudioInstanceFactory();
+
+                            marshalledObjects.Add(visualStudioInstanceFactory);
+                            var summary = await RunTestCollectionForVersionAsync(visualStudioInstanceFactory, currentAttempt, currentInstance, completedTestCaseIds, suspectCrashingTestCaseIds, messageBus, testCollection, testsForThisAttempt, cancellationTokenSource);
+                            result.Aggregate(summary);
+                        }
+
+                        currentTests = currentTests.Where(test => !completedTestCaseIds.Contains(test.UniqueID)).ToArray();
+                        if (currentTests.Length == 0 || currentTests.All(test => suspectCrashingTestCaseIds.Contains(test.UniqueID)))
+                        {
+                            break;
+                        }
+                    }
+
+                    // Anything still uncompleted is a suspected VS-crasher. Run each in isolation in its own fresh
+                    // VS instance with finalAttempt semantics so a crash only affects that single test.
+                    foreach (var suspect in currentTests.Where(test => !completedTestCaseIds.Contains(test.UniqueID)))
+                    {
                         using var marshalledObjects = new MarshalledObjects();
                         using var visualStudioInstanceFactory = new VisualStudioInstanceFactory();
 
                         marshalledObjects.Add(visualStudioInstanceFactory);
-                        var summary = await RunTestCollectionForVersionAsync(visualStudioInstanceFactory, currentAttempt, currentInstance, completedTestCaseIds, messageBus, testCollection, currentTests, cancellationTokenSource);
+                        var summary = await RunTestCollectionForVersionAsync(visualStudioInstanceFactory, currentAttempt: currentInstance.MaxAttempts - 1, currentInstance, completedTestCaseIds, suspectCrashingTestCaseIds, messageBus, testCollection, new[] { suspect }, cancellationTokenSource);
                         result.Aggregate(summary);
-
-                        currentTests = currentTests.Where(test => !completedTestCaseIds.Contains(test.UniqueID)).ToArray();
-                        if (currentTests.Length == 0)
-                        {
-                            break;
-                        }
                     }
                 }
 
@@ -109,7 +135,7 @@ namespace Xunit.Harness
                     using (var visualStudioInstanceFactory = new VisualStudioInstanceFactory(leaveRunning: true))
                     {
                         marshalledObjects.Add(visualStudioInstanceFactory);
-                        var summary = await RunTestCollectionForVersionAsync(visualStudioInstanceFactory, currentAttempt: 0, ideInstanceTestCase.VisualStudioInstanceKey, completedTestCaseIds, messageBus, testCollection, new[] { ideInstanceTestCase }, cancellationTokenSource);
+                        var summary = await RunTestCollectionForVersionAsync(visualStudioInstanceFactory, currentAttempt: 0, ideInstanceTestCase.VisualStudioInstanceKey, completedTestCaseIds, suspectCrashingTestCaseIds, messageBus, testCollection, new[] { ideInstanceTestCase }, cancellationTokenSource);
                         result.Aggregate(summary);
                     }
                 }
@@ -151,7 +177,7 @@ namespace Xunit.Harness
 
         /// <param name="currentAttempt">The 0-based attempt number. If this value is
         /// <c><see cref="VisualStudioInstanceKey.MaxAttempts"/> - 1</c>, a failed test will not be retried.</param>
-        protected virtual Task<RunSummary> RunTestCollectionForVersionAsync(VisualStudioInstanceFactory visualStudioInstanceFactory, int currentAttempt, VisualStudioInstanceKey visualStudioInstanceKey, HashSet<string> completedTestCaseIds, IMessageBus messageBus, ITestCollection testCollection, IEnumerable<IXunitTestCase> testCases, CancellationTokenSource cancellationTokenSource)
+        protected virtual Task<RunSummary> RunTestCollectionForVersionAsync(VisualStudioInstanceFactory visualStudioInstanceFactory, int currentAttempt, VisualStudioInstanceKey visualStudioInstanceKey, HashSet<string> completedTestCaseIds, HashSet<string> suspectCrashingTestCaseIds, IMessageBus messageBus, ITestCollection testCollection, IEnumerable<IXunitTestCase> testCases, CancellationTokenSource cancellationTokenSource)
         {
             if (visualStudioInstanceKey.Version == VisualStudioVersion.Unspecified
                 || !IdeTestCaseBase.IsInstalled(visualStudioInstanceKey.Version))
@@ -199,7 +225,7 @@ namespace Xunit.Harness
                     using (await WpfTestSharedData.Instance.TestSerializationGate.DisposableWaitAsync(CancellationToken.None))
                     {
                         // Just call back into the normal xUnit dispatch process now that we are on an STA Thread with no synchronization context.
-                        var invoker = CreateTestCollectionInvoker(visualStudioInstanceFactory, currentAttempt, visualStudioInstanceKey, completedTestCaseIds, messageBus, testCollection, testCases, cancellationTokenSource);
+                        var invoker = CreateTestCollectionInvoker(visualStudioInstanceFactory, currentAttempt, visualStudioInstanceKey, completedTestCaseIds, suspectCrashingTestCaseIds, messageBus, testCollection, testCases, cancellationTokenSource);
                         return await invoker().ConfigureAwait(true);
                     }
                 },
@@ -230,12 +256,12 @@ namespace Xunit.Harness
                 });
         }
 
-        private async Task<RunSummary> RunTestCollectionForUnspecifiedVersionAsync(HashSet<string> completedTestCaseIds, IMessageBus messageBus, ITestCollection testCollection, IEnumerable<IXunitTestCase> testCases, CancellationTokenSource cancellationTokenSource)
+        private async Task<RunSummary> RunTestCollectionForUnspecifiedVersionAsync(HashSet<string> completedTestCaseIds, IMessageBus messageBus, ITestCollection testCollection, IEnumerable<IXunitTestCase> testCases, CancellationTokenSource cancellationTokenSource, bool finalAttempt = true)
         {
             // These tests just run in the current process, but we still need to hook the assembly and collection events
             // to work correctly in mixed-testing scenarios.
             using var marshalledObjects = new MarshalledObjects();
-            var executionMessageSinkFilter = new IpcMessageSink(ExecutionMessageSink, testCases.ToDictionary<IXunitTestCase, string, ITestCase>(testCase => testCase.UniqueID, testCase => testCase), finalAttempt: true, completedTestCaseIds, cancellationTokenSource.Token);
+            var executionMessageSinkFilter = new IpcMessageSink(ExecutionMessageSink, testCases.ToDictionary<IXunitTestCase, string, ITestCase>(testCase => testCase.UniqueID, testCase => testCase), finalAttempt, completedTestCaseIds, cancellationTokenSource.Token);
             marshalledObjects.Add(executionMessageSinkFilter);
             using (var runner = new XunitTestAssemblyRunner(TestAssembly, testCases, DiagnosticMessageSink, executionMessageSinkFilter, ExecutionOptions))
             {
@@ -246,7 +272,7 @@ namespace Xunit.Harness
 
         /// <param name="currentAttempt">The 0-based attempt number. If this value is
         /// <c><see cref="VisualStudioInstanceKey.MaxAttempts"/> - 1</c>, a failed test will not be retried.</param>
-        private Func<Task<RunSummary>> CreateTestCollectionInvoker(VisualStudioInstanceFactory visualStudioInstanceFactory, int currentAttempt, VisualStudioInstanceKey visualStudioInstanceKey, HashSet<string> completedTestCaseIds, IMessageBus messageBus, ITestCollection testCollection, IEnumerable<IXunitTestCase> testCases, CancellationTokenSource cancellationTokenSource)
+        private Func<Task<RunSummary>> CreateTestCollectionInvoker(VisualStudioInstanceFactory visualStudioInstanceFactory, int currentAttempt, VisualStudioInstanceKey visualStudioInstanceKey, HashSet<string> completedTestCaseIds, HashSet<string> suspectCrashingTestCaseIds, IMessageBus messageBus, ITestCollection testCollection, IEnumerable<IXunitTestCase> testCases, CancellationTokenSource cancellationTokenSource)
         {
             return async () =>
             {
@@ -300,17 +326,69 @@ namespace Xunit.Harness
                     // in-process data collection service. We need to log it separately here.
                     DataCollectionService.CaptureFailureState(executionMessageSinkFilter?.CurrentTestCase ?? "Unknown", e);
 
-                    var previousException = WpfTestSharedData.Instance.Exception;
-                    try
+                    // Remember which test was mid-flight at the moment of the crash so the outer retry loop can push
+                    // it to the end of the batch, giving queued-but-unstarted tests a chance to actually run on retry.
+                    if (executionMessageSinkFilter?.CurrentTestCaseId is { } inFlightId)
                     {
-                        // Run the tests again, but using an error reporting test runner that will report the exception.
-                        WpfTestSharedData.Instance.Exception = e;
-                        return await RunTestCollectionForUnspecifiedVersionAsync(completedTestCaseIds, messageBus, testCollection, testCases, cancellationTokenSource).ConfigureAwait(true);
+                        suspectCrashingTestCaseIds.Add(inFlightId);
                     }
-                    finally
+
+                    // Only report failure for tests that didn't already complete successfully. Tests recorded in
+                    // completedTestCaseIds have already been reported to the runner with their real results; re-running
+                    // them through the error runner would flip earlier passes to failures.
+                    var remainingTestCases = testCases.Where(tc => !completedTestCaseIds.Contains(tc.UniqueID)).ToArray();
+                    if (remainingTestCases.Length == 0)
                     {
-                        WpfTestSharedData.Instance.Exception = previousException;
+                        return new RunSummary();
                     }
+
+                    var finalAttempt = currentAttempt == visualStudioInstanceKey.MaxAttempts - 1;
+                    var inFlightCaseId = executionMessageSinkFilter?.CurrentTestCaseId;
+
+                    // An isolation run passes a single test through a fresh VS on the final attempt. If
+                    // that single test was the in-flight crasher, the crash is definitive and we report
+                    // it as failed. In any other shape we emit skipped-will-retry so the test gets another
+                    // chance via the isolation loop.
+                    var isIsolatedFinalCrash = finalAttempt && remainingTestCases.Length == 1 && remainingTestCases[0].UniqueID == inFlightCaseId;
+                    var runSummary = new RunSummary { Total = remainingTestCases.Length };
+
+                    // Emit test-case-level messages directly. We deliberately avoid re-running via
+                    // XunitTestAssemblyRunner (as previous versions did) because that would re-emit
+                    // TestAssemblyStarting / TestCollectionStarting / TestClassStarting / TestMethodStarting
+                    // for entities the VS-side run already announced, triggering "Key already exists in
+                    // the message metadata cache" fatal errors in the VSTest adapter.
+                    foreach (var testCase in remainingTestCases)
+                    {
+                        var isInFlight = testCase.UniqueID == inFlightCaseId;
+                        var test = new XunitTest(testCase, testCase.DisplayName);
+
+                        // The in-flight test already had TestCaseStarting and TestStarting emitted by the
+                        // VS-side run before the crash. Don't re-emit them, or the adapter throws duplicate-key.
+                        if (!isInFlight)
+                        {
+                            ExecutionMessageSink.OnMessage(new TestCaseStarting(testCase));
+                            ExecutionMessageSink.OnMessage(new TestStarting(test));
+                        }
+
+                        if (isIsolatedFinalCrash && isInFlight)
+                        {
+                            var harnessFailure = new InvalidOperationException("Test execution was skipped due to a prior exception in the harness.", e);
+                            ExecutionMessageSink.OnMessage(new TestFailed(test, 0, output: null, harnessFailure));
+                            ExecutionMessageSink.OnMessage(new TestFinished(test, 0, output: null));
+                            ExecutionMessageSink.OnMessage(new TestCaseFinished(testCase, 0, testsRun: 1, testsFailed: 1, testsSkipped: 0));
+                            runSummary.Failed++;
+                            completedTestCaseIds.Add(testCase.UniqueID);
+                        }
+                        else
+                        {
+                            ExecutionMessageSink.OnMessage(new TestSkipped(test, "Test will be retried in a fresh VS instance."));
+                            ExecutionMessageSink.OnMessage(new TestFinished(test, 0, output: null));
+                            ExecutionMessageSink.OnMessage(new TestCaseFinished(testCase, 0, testsRun: 1, testsFailed: 0, testsSkipped: 1));
+                            runSummary.Skipped++;
+                        }
+                    }
+
+                    return runSummary;
                 }
             };
         }
@@ -398,6 +476,12 @@ namespace Xunit.Harness
                 private set;
             }
 
+            public string? CurrentTestCaseId
+            {
+                get;
+                private set;
+            }
+
             public bool OnMessage(IMessageSinkMessage message)
             {
                 if (message is ITestAssemblyFinished testAssemblyFinished)
@@ -432,14 +516,23 @@ namespace Xunit.Harness
 
                     return !_cancellationToken.IsCancellationRequested;
                 }
+                else if (message is ITestCaseMessage testCaseMessage && _completedTestCaseIds.Contains(testCaseMessage.TestCase.UniqueID))
+                {
+                    // Defense-in-depth: drop any stray messages for test cases that have already finished.
+                    // Re-emitting results for already-completed tests (e.g. via a post-crash error-reporter pass)
+                    // would flip earlier passes to failures in the runner UI.
+                    return !_cancellationToken.IsCancellationRequested;
+                }
                 else if (message is ITestCaseStarting testCaseStarting)
                 {
                     CurrentTestCase = DataCollectionService.GetTestName(testCaseStarting.TestCase);
+                    CurrentTestCaseId = testCaseStarting.TestCase.UniqueID;
                     return _messageSink.OnMessage(message);
                 }
                 else if (message is ITestCaseFinished testCaseFinished)
                 {
                     CurrentTestCase = null;
+                    CurrentTestCaseId = null;
 
                     if (_finalAttempt || testCaseFinished.TestsFailed == 0)
                     {
