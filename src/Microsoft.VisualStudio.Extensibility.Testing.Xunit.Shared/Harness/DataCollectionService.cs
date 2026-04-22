@@ -176,20 +176,43 @@ namespace Xunit.Harness
                 testName ??= "Unknown";
                 var errorId = ex.GetType().Name;
 
-                Directory.CreateDirectory(logDir);
+                try
+                {
+                    Directory.CreateDirectory(logDir);
+                }
+                catch
+                {
+                    // If the log directory cannot be created, skip capturing failure state
+                    // to avoid masking the original test failure exception.
+                    return;
+                }
 
-                File.WriteAllText(CreateLogFileName(logDir, timestamp, testName, errorId, logId: string.Empty, "log"), ex.ToString());
-                ScreenshotService.TakeScreenshot(CreateLogFileName(logDir, timestamp, testName, errorId, string.Empty, $"png"));
-                EventLogCollector.TryWriteDotNetEntriesToFile(CreateLogFileName(logDir, timestamp, testName, errorId, "DotNet", "log"));
-                EventLogCollector.TryWriteWatsonEntriesToFile(CreateLogFileName(logDir, timestamp, testName, errorId, "Watson", "log"));
+                TryCapture(() => File.WriteAllText(CreateLogFileName(logDir, timestamp, testName, errorId, logId: string.Empty, "log"), ex.ToString()));
+                TryCapture(() => ScreenshotService.TakeScreenshot(CreateLogFileName(logDir, timestamp, testName, errorId, string.Empty, $"png")));
+                TryCapture(() => EventLogCollector.TryWriteDotNetEntriesToFile(CreateLogFileName(logDir, timestamp, testName, errorId, "DotNet", "log")));
+                TryCapture(() => EventLogCollector.TryWriteWatsonEntriesToFile(CreateLogFileName(logDir, timestamp, testName, errorId, "Watson", "log")));
 
                 if (Process.GetCurrentProcess().ProcessName == "devenv")
                 {
-                    ActivityLogCollector.TryWriteActivityLogToFile(CreateLogFileName(logDir, timestamp, testName, errorId, "Activity", "xml"));
-                    IdeStateCollector.TryWriteIdeStateToFile(CreateLogFileName(logDir, timestamp, testName, errorId, "IDE", "log"));
+                    TryCapture(() => ActivityLogCollector.TryWriteActivityLogToFile(CreateLogFileName(logDir, timestamp, testName, errorId, "Activity", "xml")));
+                    TryCapture(() => IdeStateCollector.TryWriteIdeStateToFile(CreateLogFileName(logDir, timestamp, testName, errorId, "IDE", "log")));
                     foreach (var (callback, logId, extension) in _customInProcessLoggers)
                     {
-                        callback(CreateLogFileName(logDir, timestamp, testName, errorId, logId, extension));
+                        var logFileName = CreateLogFileName(logDir, timestamp, testName, errorId, logId, extension);
+                        TryCapture(() => callback(logFileName));
+                    }
+                }
+
+                static void TryCapture(Action action)
+                {
+                    try
+                    {
+                        action();
+                    }
+                    catch
+                    {
+                        // Suppress exceptions from individual capture steps to avoid
+                        // masking the original test failure exception.
                     }
                 }
             }
