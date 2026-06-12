@@ -558,9 +558,16 @@ namespace Xunit.Harness
                 }
                 else if (!_finalAttempt && message is ITestFailed testFailed)
                 {
+                    // This test failed a non-final attempt and will be retried. Record it so flaky
+                    // tests (fail-then-pass) can be identified after the run, and surface the cause
+                    // in the skip reason so it is greppable in the build log. The full per-attempt
+                    // exception, screenshot, and IDE state are captured separately by DataCollectionService.
+                    var errorId = testFailed.ExceptionTypes.FirstOrDefault() ?? "Unknown";
+                    var failureMessage = testFailed.Messages.FirstOrDefault() ?? string.Empty;
+                    DataCollectionService.RecordRetriedFailure(testFailed.Test.DisplayName, errorId, failureMessage);
+
                     // This test will run again; report it as skipped instead of failed
-                    // TODO: What kind of additional logs should we include?
-                    message = new TestSkipped(testFailed.Test, "Test will automatically retry.");
+                    message = new TestSkipped(testFailed.Test, $"FLAKY (will retry): failed with {errorId}.");
                 }
                 else if (message is ITestAssemblyStarting)
                 {

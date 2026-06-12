@@ -16,6 +16,7 @@ namespace Xunit.Harness
     public static class DataCollectionService
     {
         private static readonly ConditionalWeakTable<Exception, StrongBox<bool>> LoggedExceptions = new();
+        private static readonly object _flakyReportLock = new object();
         private static ImmutableList<CustomLoggerData> _customInProcessLoggers = ImmutableList<CustomLoggerData>.Empty;
         private static bool _firstChanceExceptionHandlerInstalled;
 
@@ -176,20 +177,43 @@ namespace Xunit.Harness
                 testName ??= "Unknown";
                 var errorId = ex.GetType().Name;
 
-                Directory.CreateDirectory(logDir);
+                try
+                {
+                    Directory.CreateDirectory(logDir);
+                }
+                catch
+                {
+                    // If the log directory cannot be created, skip capturing failure state
+                    // to avoid masking the original test failure exception.
+                    return;
+                }
 
-                File.WriteAllText(CreateLogFileName(logDir, timestamp, testName, errorId, logId: string.Empty, "log"), ex.ToString());
-                ScreenshotService.TakeScreenshot(CreateLogFileName(logDir, timestamp, testName, errorId, string.Empty, $"png"));
-                EventLogCollector.TryWriteDotNetEntriesToFile(CreateLogFileName(logDir, timestamp, testName, errorId, "DotNet", "log"));
-                EventLogCollector.TryWriteWatsonEntriesToFile(CreateLogFileName(logDir, timestamp, testName, errorId, "Watson", "log"));
+                TryCapture(() => File.WriteAllText(CreateLogFileName(logDir, timestamp, testName, errorId, logId: string.Empty, "log"), ex.ToString()));
+                TryCapture(() => ScreenshotService.TakeScreenshot(CreateLogFileName(logDir, timestamp, testName, errorId, string.Empty, $"png")));
+                TryCapture(() => EventLogCollector.TryWriteDotNetEntriesToFile(CreateLogFileName(logDir, timestamp, testName, errorId, "DotNet", "log")));
+                TryCapture(() => EventLogCollector.TryWriteWatsonEntriesToFile(CreateLogFileName(logDir, timestamp, testName, errorId, "Watson", "log")));
 
                 if (Process.GetCurrentProcess().ProcessName == "devenv")
                 {
-                    ActivityLogCollector.TryWriteActivityLogToFile(CreateLogFileName(logDir, timestamp, testName, errorId, "Activity", "xml"));
-                    IdeStateCollector.TryWriteIdeStateToFile(CreateLogFileName(logDir, timestamp, testName, errorId, "IDE", "log"));
+                    TryCapture(() => ActivityLogCollector.TryWriteActivityLogToFile(CreateLogFileName(logDir, timestamp, testName, errorId, "Activity", "xml")));
+                    TryCapture(() => IdeStateCollector.TryWriteIdeStateToFile(CreateLogFileName(logDir, timestamp, testName, errorId, "IDE", "log")));
                     foreach (var (callback, logId, extension) in _customInProcessLoggers)
                     {
-                        callback(CreateLogFileName(logDir, timestamp, testName, errorId, logId, extension));
+                        var logFileName = CreateLogFileName(logDir, timestamp, testName, errorId, logId, extension);
+                        TryCapture(() => callback(logFileName));
+                    }
+                }
+
+                static void TryCapture(Action action)
+                {
+                    try
+                    {
+                        action();
+                    }
+                    catch
+                    {
+                        // Suppress exceptions from individual capture steps to avoid
+                        // masking the original test failure exception.
                     }
                 }
             }
@@ -262,6 +286,36 @@ namespace Xunit.Harness
         {
             var assemblyPath = typeof(DataCollectionService).Assembly.Location;
             return Path.GetDirectoryName(assemblyPath);
+        }
+
+        /// <summary>
+        /// Records a test that failed a non-final attempt and is about to be retried, so flaky
+        /// tests can be identified after the run. A test that appears here but passes in the TRX
+        /// is flaky (failed then recovered); one that appears here and also fails in the TRX is a
+        /// hard failure. Each occurrence is appended as a tab-separated line to
+        /// <c>flaky-tests.log</c> alongside the other failure-state captures.
+        /// </summary>
+        internal static void RecordRetriedFailure(string testName, string errorId, string message)
+        {
+            try
+            {
+                var logDir = GetLogDirectory();
+                Directory.CreateDirectory(logDir);
+                var reportPath = Path.Combine(logDir, "flaky-tests.log");
+
+                // Collapse newlines so each retried failure stays on a single, greppable line.
+                var sanitizedMessage = (message ?? string.Empty).Replace("\r", " ").Replace("\n", " ");
+                var line = $"{DateTimeOffset.UtcNow:o}\t{testName}\t{errorId}\t{sanitizedMessage}";
+
+                lock (_flakyReportLock)
+                {
+                    File.AppendAllText(reportPath, line + Environment.NewLine);
+                }
+            }
+            catch
+            {
+                // Never let flaky-report bookkeeping interfere with test execution.
+            }
         }
 
         internal record struct CustomLoggerData(Action<string> Callback, string LogId, string Extension);
