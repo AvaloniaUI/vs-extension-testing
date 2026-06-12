@@ -16,6 +16,7 @@ namespace Xunit.Harness
     public static class DataCollectionService
     {
         private static readonly ConditionalWeakTable<Exception, StrongBox<bool>> LoggedExceptions = new();
+        private static readonly object _flakyReportLock = new object();
         private static ImmutableList<CustomLoggerData> _customInProcessLoggers = ImmutableList<CustomLoggerData>.Empty;
         private static bool _firstChanceExceptionHandlerInstalled;
 
@@ -285,6 +286,36 @@ namespace Xunit.Harness
         {
             var assemblyPath = typeof(DataCollectionService).Assembly.Location;
             return Path.GetDirectoryName(assemblyPath);
+        }
+
+        /// <summary>
+        /// Records a test that failed a non-final attempt and is about to be retried, so flaky
+        /// tests can be identified after the run. A test that appears here but passes in the TRX
+        /// is flaky (failed then recovered); one that appears here and also fails in the TRX is a
+        /// hard failure. Each occurrence is appended as a tab-separated line to
+        /// <c>flaky-tests.log</c> alongside the other failure-state captures.
+        /// </summary>
+        internal static void RecordRetriedFailure(string testName, string errorId, string message)
+        {
+            try
+            {
+                var logDir = GetLogDirectory();
+                Directory.CreateDirectory(logDir);
+                var reportPath = Path.Combine(logDir, "flaky-tests.log");
+
+                // Collapse newlines so each retried failure stays on a single, greppable line.
+                var sanitizedMessage = (message ?? string.Empty).Replace("\r", " ").Replace("\n", " ");
+                var line = $"{DateTimeOffset.UtcNow:o}\t{testName}\t{errorId}\t{sanitizedMessage}";
+
+                lock (_flakyReportLock)
+                {
+                    File.AppendAllText(reportPath, line + Environment.NewLine);
+                }
+            }
+            catch
+            {
+                // Never let flaky-report bookkeeping interfere with test execution.
+            }
         }
 
         internal record struct CustomLoggerData(Action<string> Callback, string LogId, string Extension);
