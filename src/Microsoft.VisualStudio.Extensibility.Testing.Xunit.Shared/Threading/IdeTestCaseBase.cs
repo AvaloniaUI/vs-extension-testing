@@ -6,6 +6,7 @@ namespace Xunit.Threading
     using System;
     using System.ComponentModel;
     using System.Linq;
+    using System.Text;
     using Xunit.Abstractions;
     using Xunit.Harness;
     using Xunit.Sdk;
@@ -26,10 +27,7 @@ namespace Xunit.Threading
             SharedData = WpfTestSharedData.Instance;
             VisualStudioInstanceKey = visualStudioInstanceKey;
 
-            if (!IsInstalled(visualStudioInstanceKey.Version))
-            {
-                SkipReason = $"{visualStudioInstanceKey.Version} is not installed";
-            }
+            SkipReason = GetSkipReasonIfNotInstalled(visualStudioInstanceKey.Version);
         }
 
         public VisualStudioInstanceKey VisualStudioInstanceKey
@@ -102,44 +100,92 @@ namespace Xunit.Threading
 
         internal static bool IsInstalled(VisualStudioVersion visualStudioVersion)
         {
-            int majorVersion;
+            return GetSkipReasonIfNotInstalled(visualStudioVersion) is null;
+        }
+
+        /// <summary>
+        /// Returns <see langword="null"/> if a Visual Studio instance with the major version corresponding to
+        /// <paramref name="visualStudioVersion"/> was discovered via the Visual Studio Setup Configuration COM API.
+        /// Otherwise returns a multi-line skip reason describing what was detected and how to address the problem.
+        /// </summary>
+        internal static string? GetSkipReasonIfNotInstalled(VisualStudioVersion visualStudioVersion)
+        {
+            int expectedMajorVersion;
 
             switch (visualStudioVersion)
             {
             case VisualStudioVersion.VS2012:
-                majorVersion = 11;
+                expectedMajorVersion = 11;
                 break;
 
             case VisualStudioVersion.VS2013:
-                majorVersion = 12;
+                expectedMajorVersion = 12;
                 break;
 
             case VisualStudioVersion.VS2015:
-                majorVersion = 14;
+                expectedMajorVersion = 14;
                 break;
 
             case VisualStudioVersion.VS2017:
-                majorVersion = 15;
+                expectedMajorVersion = 15;
                 break;
 
             case VisualStudioVersion.VS2019:
-                majorVersion = 16;
+                expectedMajorVersion = 16;
                 break;
 
             case VisualStudioVersion.VS2022:
-                majorVersion = 17;
+                expectedMajorVersion = 17;
                 break;
 
             case VisualStudioVersion.VS18:
-                majorVersion = 18;
+                expectedMajorVersion = 18;
                 break;
 
             default:
                 throw new ArgumentException();
             }
 
-            var instances = VisualStudioInstanceFactory.EnumerateVisualStudioInstances();
-            return instances.Any(i => i.Item2.Major == majorVersion);
+            var sb = new StringBuilder();
+
+            try
+            {
+                var detected = VisualStudioInstanceFactory.EnumerateVisualStudioInstances().ToList();
+                if (detected.Any(i => i.Item2.Major == expectedMajorVersion))
+                {
+                    return null;
+                }
+
+                sb.Append(visualStudioVersion).Append(" is not installed: no Visual Studio instance with major version ").Append(expectedMajorVersion).AppendLine(" was found by the Visual Studio Setup Configuration COM API.");
+                sb.AppendLine();
+                if (detected.Count == 0)
+                {
+                    sb.AppendLine("No Visual Studio instances were detected.");
+                }
+                else
+                {
+                    sb.Append("Detected Visual Studio instance(s) (").Append(detected.Count).AppendLine("):");
+                    foreach (var instance in detected)
+                    {
+                        sb.Append("  - ").Append(instance.Item2).Append(" (").Append(instance.Item4).Append(") at ").AppendLine(instance.Item1);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                sb.Append(visualStudioVersion).Append(" could not be detected: failed to enumerate Visual Studio instances (").Append(ex.GetType().Name).Append(": ").Append(ex.Message).AppendLine(").");
+                sb.AppendLine();
+                sb.AppendLine("The Visual Studio Setup Configuration COM service is required to discover installed instances. Re-running the Visual Studio Installer typically restores it.");
+            }
+
+            sb.AppendLine();
+            sb.AppendLine("To run these tests:");
+            sb.Append("  - Install a Visual Studio release with major version ").Append(expectedMajorVersion).Append(" (").Append(visualStudioVersion).AppendLine(") via the Visual Studio Installer.");
+            sb.AppendLine("  - Or set the VSInstallDir environment variable to the installation path of an installed VS instance with the required major version, then re-run the tests.");
+            sb.AppendLine("  - Verify what the Setup Configuration COM API reports by running:");
+            sb.AppendLine("      \"%ProgramFiles(x86)%\\Microsoft Visual Studio\\Installer\\vswhere.exe\" -all -prerelease -format json");
+
+            return sb.ToString().TrimEnd();
         }
     }
 }
