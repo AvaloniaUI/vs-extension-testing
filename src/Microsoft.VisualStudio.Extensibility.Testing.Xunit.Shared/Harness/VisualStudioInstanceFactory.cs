@@ -344,14 +344,99 @@ namespace Xunit.Harness
 
                     if (installProcess.ExitCode != 0)
                     {
+                        var standardError = await standardErrorAsync.ConfigureAwait(true);
+                        var standardOutput = await standardOutputAsync.ConfigureAwait(true);
+
                         var messageBuilder = new StringBuilder();
-                        messageBuilder.AppendLine($"VSIX installer failed with exit code: {installProcess.ExitCode}");
+                        messageBuilder.AppendLine($"VSIX installer failed with exit code: {installProcess.ExitCode} (0x{installProcess.ExitCode:X8}) while installing '{extension}'.");
+                        messageBuilder.AppendLine($"Command line: \"{vsixInstallerExeFile}\" {arguments}");
                         messageBuilder.AppendLine();
                         messageBuilder.AppendLine($"Standard Error:");
-                        messageBuilder.AppendLine(await standardErrorAsync.ConfigureAwait(true));
+                        messageBuilder.AppendLine(standardError);
                         messageBuilder.AppendLine();
                         messageBuilder.AppendLine($"Standard Output:");
-                        messageBuilder.AppendLine(await standardOutputAsync.ConfigureAwait(true));
+                        messageBuilder.AppendLine(standardOutput);
+
+                        // VSIXInstaller.exe writes its real diagnostics to the file named by /logFile in %TEMP%.
+                        // Inline it so the actual cause shows up in the test output even when the test-host
+                        // shadow-copy directory (where the harness later moves it) gets wiped.
+                        string? installerLogText = null;
+                        var installerLogPath = Path.Combine(Path.GetTempPath(), logFileName);
+                        if (File.Exists(installerLogPath))
+                        {
+                            messageBuilder.AppendLine();
+                            messageBuilder.AppendLine($"VSIX installer log ({installerLogPath}):");
+                            try
+                            {
+                                using var logReader = new StreamReader(new FileStream(installerLogPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete));
+                                installerLogText = logReader.ReadToEnd();
+                                messageBuilder.AppendLine(installerLogText);
+                            }
+                            catch (Exception logEx)
+                            {
+                                messageBuilder.AppendLine($"  (failed to read installer log: {logEx.GetType().Name}: {logEx.Message})");
+                            }
+                        }
+                        else
+                        {
+                            messageBuilder.AppendLine();
+                            messageBuilder.AppendLine($"VSIX installer log not found at '{installerLogPath}'.");
+                        }
+
+                        // Surface the additional dd_VSIXInstaller_*.log files VSIXInstaller writes on its own.
+                        // They are short (command line only) but include the exact installer binary used.
+                        try
+                        {
+                            var ddLogs = new DirectoryInfo(Path.GetTempPath())
+                                .GetFiles("dd_VSIXInstaller_*.log")
+                                .OrderByDescending(f => f.LastWriteTimeUtc)
+                                .Take(1)
+                                .ToArray();
+                            foreach (var ddLog in ddLogs)
+                            {
+                                messageBuilder.AppendLine();
+                                messageBuilder.AppendLine($"Most recent dd_VSIXInstaller log ({ddLog.FullName}):");
+                                try
+                                {
+                                    using var ddReader = new StreamReader(new FileStream(ddLog.FullName, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete));
+                                    messageBuilder.AppendLine(ddReader.ReadToEnd());
+                                }
+                                catch (Exception ddEx)
+                                {
+                                    messageBuilder.AppendLine($"  (failed to read dd log: {ddEx.GetType().Name}: {ddEx.Message})");
+                                }
+                            }
+                        }
+                        catch
+                        {
+                            // best-effort only
+                        }
+
+                        // Detect the known "strong name validation failed" condition. This commonly happens
+                        // on developer machines that have a Visual Studio Canary/Insiders build installed
+                        // alongside another SKU, because the shared VSIXInstaller.exe loads
+                        // Microsoft.VisualStudio.Interop with mismatched strong-name expectations. Point
+                        // developers at the one-time setup script that registers a SkipVerification entry
+                        // so VSIXInstaller can proceed.
+                        if (LooksLikeStrongNameValidationFailure(installerLogText, standardError, standardOutput))
+                        {
+                            messageBuilder.AppendLine();
+                            messageBuilder.AppendLine("------------------------------------------------------------");
+                            messageBuilder.AppendLine("Detected: Visual Studio strong-name validation failure (HRESULT 0x8013141A)");
+                            messageBuilder.AppendLine("inside VSIXInstaller.exe. This is a machine-state issue, not a test failure.");
+                            messageBuilder.AppendLine();
+                            messageBuilder.AppendLine("It typically affects developer machines that have a Visual Studio Canary or");
+                            messageBuilder.AppendLine("Insiders build installed side-by-side with another VS SKU.");
+                            messageBuilder.AppendLine();
+                            messageBuilder.AppendLine("Workaround: run the one-time setup script from an ELEVATED PowerShell prompt:");
+                            messageBuilder.AppendLine();
+                            messageBuilder.AppendLine("    powershell -ExecutionPolicy Bypass -File build\\Set-DevMachineStrongNameSkip.ps1");
+                            messageBuilder.AppendLine();
+                            messageBuilder.AppendLine("The script registers a SkipVerification entry for Microsoft.VisualStudio.Interop");
+                            messageBuilder.AppendLine("under HKLM\\SOFTWARE\\Microsoft\\StrongName\\Verification (and the Wow6432Node mirror).");
+                            messageBuilder.AppendLine("Re-running the integration tests after the script completes should succeed.");
+                            messageBuilder.AppendLine("------------------------------------------------------------");
+                        }
 
                         throw new InvalidOperationException(messageBuilder.ToString());
                     }
@@ -446,6 +531,41 @@ namespace Xunit.Harness
             }
 
             return path;
+        }
+
+        /// <summary>
+        /// Returns <see langword="true"/> if any of the supplied diagnostic strings carry the well-known
+        /// "strong name validation failed" signature that VSIXInstaller.exe surfaces when it cannot load
+        /// <c>Microsoft.VisualStudio.Interop</c> on a machine with a side-by-side Visual Studio
+        /// Canary/Insiders install.
+        /// </summary>
+        private static bool LooksLikeStrongNameValidationFailure(string? installerLogText, string? standardError, string? standardOutput)
+        {
+            return ContainsSignature(installerLogText)
+                || ContainsSignature(standardError)
+                || ContainsSignature(standardOutput);
+
+            static bool ContainsSignature(string? text)
+            {
+                if (string.IsNullOrEmpty(text))
+                {
+                    return false;
+                }
+
+                if (text!.IndexOf("0x8013141A", StringComparison.OrdinalIgnoreCase) >= 0
+                    || text.IndexOf("Strong name validation failed", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    return true;
+                }
+
+                if (text.IndexOf("Microsoft.VisualStudio.Interop", StringComparison.OrdinalIgnoreCase) >= 0
+                    && text.IndexOf("strong name", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    return true;
+                }
+
+                return false;
+            }
         }
 
         private static void TakeSnapshotEveryTimeSpanUntilProcessExit(Process process, string commandBeingExecuted)

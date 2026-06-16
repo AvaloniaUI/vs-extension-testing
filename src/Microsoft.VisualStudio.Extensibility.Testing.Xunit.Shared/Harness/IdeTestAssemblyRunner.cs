@@ -9,6 +9,7 @@ namespace Xunit.Harness
     using System.Diagnostics;
     using System.Linq;
     using System.Reflection;
+    using System.Text;
     using System.Threading;
     using System.Threading.Tasks;
     using System.Windows.Threading;
@@ -352,6 +353,8 @@ namespace Xunit.Harness
                     var isIsolatedFinalCrash = finalAttempt && remainingTestCases.Length == 1 && remainingTestCases[0].UniqueID == inFlightCaseId;
                     var runSummary = new RunSummary { Total = remainingTestCases.Length };
 
+                    var retrySkipMessage = BuildHarnessFailureSkipMessage(e, currentAttempt, visualStudioInstanceKey.MaxAttempts, inFlightCaseId);
+
                     // Emit test-case-level messages directly. We deliberately avoid re-running via
                     // XunitTestAssemblyRunner (as previous versions did) because that would re-emit
                     // TestAssemblyStarting / TestCollectionStarting / TestClassStarting / TestMethodStarting
@@ -372,7 +375,7 @@ namespace Xunit.Harness
 
                         if (isIsolatedFinalCrash && isInFlight)
                         {
-                            var harnessFailure = new InvalidOperationException("Test execution was skipped due to a prior exception in the harness.", e);
+                            var harnessFailure = new InvalidOperationException(retrySkipMessage, e);
                             ExecutionMessageSink.OnMessage(new TestFailed(test, 0, output: null, harnessFailure));
                             ExecutionMessageSink.OnMessage(new TestFinished(test, 0, output: null));
                             ExecutionMessageSink.OnMessage(new TestCaseFinished(testCase, 0, testsRun: 1, testsFailed: 1, testsSkipped: 0));
@@ -381,7 +384,7 @@ namespace Xunit.Harness
                         }
                         else
                         {
-                            ExecutionMessageSink.OnMessage(new TestSkipped(test, "Test will be retried in a fresh VS instance."));
+                            ExecutionMessageSink.OnMessage(new TestSkipped(test, retrySkipMessage));
                             ExecutionMessageSink.OnMessage(new TestFinished(test, 0, output: null));
                             ExecutionMessageSink.OnMessage(new TestCaseFinished(testCase, 0, testsRun: 1, testsFailed: 0, testsSkipped: 1));
                             runSummary.Skipped++;
@@ -391,6 +394,57 @@ namespace Xunit.Harness
                     return runSummary;
                 }
             };
+        }
+
+        /// <summary>
+        /// Builds a multi-line message describing a harness-side failure that occurred while running a batch of
+        /// tests inside the Visual Studio instance. Includes the exception type/message, attempt counters, the
+        /// in-flight test case (if any) and the directory where the full exception, screenshots, activity log
+        /// and IDE state were captured by <see cref="DataCollectionService.CaptureFailureState"/>.
+        /// </summary>
+        private static string BuildHarnessFailureSkipMessage(Exception ex, int currentAttempt, int maxAttempts, string? inFlightCaseId)
+        {
+            var sb = new StringBuilder();
+            sb.Append("Test will be retried in a fresh VS instance (attempt ")
+              .Append(currentAttempt + 1).Append('/').Append(maxAttempts).AppendLine(" failed in the test harness).");
+
+            sb.AppendLine();
+            sb.Append("Harness exception: ").Append(ex.GetType().FullName).Append(": ").AppendLine(ex.Message);
+            if (!string.IsNullOrEmpty(inFlightCaseId))
+            {
+                sb.Append("In-flight test at time of failure: ").AppendLine(inFlightCaseId);
+            }
+            else
+            {
+                sb.AppendLine("No test was mid-flight when the failure occurred (the harness failed before dispatching a test). This usually indicates the experimental VS instance failed to start, the VSIX under test failed to load, or a remoting/COM handshake failed.");
+            }
+
+            string? logDir = null;
+            try
+            {
+                logDir = DataCollectionService.GetLogDirectory();
+            }
+            catch
+            {
+                // Best-effort: never let log-path discovery hide the original exception info.
+            }
+
+            if (!string.IsNullOrEmpty(logDir))
+            {
+                sb.AppendLine();
+                sb.Append("Full exception, screenshot, DotNet/Watson event log entries and (if available) VS Activity log and IDE state were written to:").AppendLine();
+                sb.Append("  ").AppendLine(logDir);
+                sb.AppendLine("Look for files named '<time>-<TestName>-<ExceptionType>.log' (exception) and '.png' (screenshot at time of failure).");
+            }
+
+            sb.AppendLine();
+            sb.AppendLine("Common causes:");
+            sb.AppendLine("  - The experimental VS instance crashed or failed to start (check the Watson and IDE logs).");
+            sb.AppendLine("  - The VSIX under test failed to load into the experimental hive (check the Activity log).");
+            sb.AppendLine("  - A required MEF component is missing or the experimental hive is corrupt (try resetting it: 'devenv /rootsuffix Exp /resetuserdata').");
+            sb.AppendLine("  - A remoting / COM call across the test harness boundary timed out or failed.");
+
+            return sb.ToString().TrimEnd();
         }
 
         private ImmutableList<string> GetExtensionFiles(IEnumerable<IXunitTestCase> testCases)
