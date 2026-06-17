@@ -27,7 +27,10 @@ namespace Xunit.Threading
             SharedData = WpfTestSharedData.Instance;
             VisualStudioInstanceKey = visualStudioInstanceKey;
 
-            SkipReason = GetSkipReasonIfNotInstalled(visualStudioInstanceKey.Version);
+            // Preserve any SkipReason already set by the base ctor from FactAttribute.Skip
+            // (e.g. ManualRunOnlyIdeFactAttribute setting Skip when _IntegrationTestsRunningInCI is present).
+            // Only assign the "not installed" reason if no skip was already chosen.
+            SkipReason ??= GetSkipReasonIfNotInstalled(visualStudioInstanceKey.Version);
         }
 
         public VisualStudioInstanceKey VisualStudioInstanceKey
