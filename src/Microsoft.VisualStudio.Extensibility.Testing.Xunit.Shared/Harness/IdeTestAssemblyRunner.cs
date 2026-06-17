@@ -24,6 +24,14 @@ namespace Xunit.Harness
         /// </summary>
         private static readonly TimeSpan HangMitigatingTimeout = TimeSpan.FromMinutes(1);
 
+        /// <summary>
+        /// Ceiling for an <see cref="IDisposable.Dispose"/> call on a cross-process (.NET Remoting) proxy.
+        /// If the proxy's underlying IPC channel is alive-but-unresponsive the call can park indefinitely;
+        /// 30 seconds is comfortably above any well-behaved teardown but well below the surrounding test
+        /// host's hang watchdog (10 minutes for this repo).
+        /// </summary>
+        private static readonly TimeSpan RemoteDisposeTimeout = TimeSpan.FromSeconds(30);
+
         private HashSet<VisualStudioInstanceKey>? _ideInstancesInTests;
 
         public IdeTestAssemblyRunner(ITestAssembly testAssembly, IEnumerable<IXunitTestCase> testCases, IMessageSink diagnosticMessageSink, IMessageSink executionMessageSink, ITestFrameworkExecutionOptions executionOptions)
@@ -297,27 +305,44 @@ namespace Xunit.Harness
                                 ? new KeyValuePair<string, string>(variable.Substring(0, index), variable.Substring(index + 1))
                                 : new KeyValuePair<string, string>(variable, string.Empty)));
 
-                    // Install a COM message filter to handle retry operations when the first attempt fails
+                    // Install a COM message filter to handle retry operations when the first attempt fails.
+                    // messageFilter is in-process COM; its Dispose can stay synchronous.
+                    // visualStudioContext and runner are remoting proxies — if the VS process has gone
+                    // away their Dispose() will throw fast, but if the channel is alive-but-unresponsive
+                    // Dispose can park indefinitely. Wrap those with a bounded helper so the test host
+                    // can never wedge on a dead-but-not-faulted IPC channel.
                     using (var messageFilter = new MessageFilter())
-                    using (var visualStudioContext = await visualStudioInstanceFactory.GetNewOrUsedInstanceAsync(GetVersion(visualStudioInstanceKey.Version), visualStudioInstanceKey.RootSuffix, environmentVariables, GetExtensionFiles(testCases), ImmutableHashSet.Create<string>()).ConfigureAwait(true))
                     {
-                        using (var runner = visualStudioContext.Instance.TestInvoker.CreateTestAssemblyRunner(new IpcTestAssembly(TestAssembly), testCases.ToArray(), new IpcMessageSink(DiagnosticMessageSink, knownTestCasesByUniqueId, finalAttempt, new HashSet<string>(), cancellationTokenSource.Token), executionMessageSinkFilter, new IpcTestFrameworkExecutionOptions(ExecutionOptions)))
+                        var visualStudioContext = await visualStudioInstanceFactory.GetNewOrUsedInstanceAsync(GetVersion(visualStudioInstanceKey.Version), visualStudioInstanceKey.RootSuffix, environmentVariables, GetExtensionFiles(testCases), ImmutableHashSet.Create<string>()).ConfigureAwait(true);
+                        try
                         {
-                            marshalledObjects.Add(runner);
-
-                            var ipcMessageBus = new IpcMessageBus(messageBus);
-                            marshalledObjects.Add(ipcMessageBus);
-
-                            var result = runner.RunTestCollection(ipcMessageBus, testCollection, testCases.ToArray());
-                            var runSummary = new RunSummary
+                            var runner = visualStudioContext.Instance.TestInvoker.CreateTestAssemblyRunner(new IpcTestAssembly(TestAssembly), testCases.ToArray(), new IpcMessageSink(DiagnosticMessageSink, knownTestCasesByUniqueId, finalAttempt, new HashSet<string>(), cancellationTokenSource.Token), executionMessageSinkFilter, new IpcTestFrameworkExecutionOptions(ExecutionOptions));
+                            try
                             {
-                                Total = result.Item1,
-                                Failed = result.Item2,
-                                Skipped = result.Item3,
-                                Time = result.Item4,
-                            };
+                                marshalledObjects.Add(runner);
 
-                            return runSummary;
+                                var ipcMessageBus = new IpcMessageBus(messageBus);
+                                marshalledObjects.Add(ipcMessageBus);
+
+                                var result = runner.RunTestCollection(ipcMessageBus, testCollection, testCases.ToArray());
+                                var runSummary = new RunSummary
+                                {
+                                    Total = result.Item1,
+                                    Failed = result.Item2,
+                                    Skipped = result.Item3,
+                                    Time = result.Item4,
+                                };
+
+                                return runSummary;
+                            }
+                            finally
+                            {
+                                BoundedDispose(runner, RemoteDisposeTimeout, nameof(runner));
+                            }
+                        }
+                        finally
+                        {
+                            BoundedDispose(visualStudioContext, RemoteDisposeTimeout, nameof(visualStudioContext));
                         }
                     }
                 }
@@ -394,6 +419,48 @@ namespace Xunit.Harness
                     return runSummary;
                 }
             };
+        }
+
+        /// <summary>
+        /// Dispose <paramref name="target"/> on a background thread with a hard <paramref name="timeout"/>.
+        /// If the call doesn't return in time, the wait is abandoned and the worker thread is left to
+        /// finish (or be reaped with the test host). Use this for remoting proxies where the underlying
+        /// IPC channel may be alive-but-unresponsive — synchronous Dispose on those can park indefinitely.
+        /// A <see cref="System.Runtime.Remoting.RemotingException"/> from the proxy is swallowed here:
+        /// the IDE is being torn down anyway, and surfacing it would mask the original failure.
+        /// </summary>
+        private static void BoundedDispose(IDisposable? target, TimeSpan timeout, string label)
+        {
+            if (target is null)
+            {
+                return;
+            }
+
+            using var done = new ManualResetEventSlim(false);
+            var disposer = new Thread(() =>
+            {
+                try
+                {
+                    target.Dispose();
+                }
+                catch
+                {
+                    // Suppress: see method summary. The original test failure must not be masked.
+                }
+                finally
+                {
+                    done.Set();
+                }
+            })
+            {
+                IsBackground = true,
+                Name = "Bounded Dispose: " + label,
+            };
+            disposer.Start();
+            done.Wait(timeout);
+
+            // Whether the wait returned true (Dispose completed) or false (we're abandoning), we
+            // return synchronously here. Abandoned workers are harmless background threads.
         }
 
         /// <summary>

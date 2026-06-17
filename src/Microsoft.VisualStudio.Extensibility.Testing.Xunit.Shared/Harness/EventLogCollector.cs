@@ -11,6 +11,7 @@ namespace Xunit.Harness
     using System.IO;
     using System.Linq;
     using System.Text;
+    using System.Threading.Tasks;
 
     /// <summary>
     /// Helper class to read the Application Event Log for Watson and .NET Runtime entries.
@@ -118,9 +119,39 @@ namespace Xunit.Harness
         };
 
         /// <summary>
+        /// Hard ceiling for an event-log scan. Reading the Application log can park in <c>EvtRender</c>
+        /// for tens of minutes on noisy CI images; we'd rather lose the diagnostic than wedge the host.
+        /// </summary>
+        private static readonly TimeSpan EventLogScanTimeout = TimeSpan.FromSeconds(30);
+
+        /// <summary>
+        /// Skip the event-log scrape entirely under CI. The output is a developer-machine diagnostic;
+        /// CI runs already capture dumps + screenshots, and CI images' Application logs have repeatedly
+        /// wedged this code path. Honors the de-facto <c>CI</c> environment variable (set by GitHub
+        /// Actions, GitLab, CircleCI, Travis, Buildkite, AppVeyor).
+        /// </summary>
+        private static bool IsRunningInCi()
+        {
+            var ci = Environment.GetEnvironmentVariable("CI");
+            return !string.IsNullOrEmpty(ci)
+                && !string.Equals(ci, "0", StringComparison.Ordinal)
+                && !string.Equals(ci, "false", StringComparison.OrdinalIgnoreCase);
+        }
+
+        /// <summary>
         /// Get the WER entries for VS and VS related EXEs from the Event Log and write them to a file.
         /// </summary>
         internal static void TryWriteWatsonEntriesToFile(string filePath)
+        {
+            if (IsRunningInCi())
+            {
+                return;
+            }
+
+            RunBoundedOrAbandon(filePath, () => CollectWatsonEntries(filePath));
+        }
+
+        private static void CollectWatsonEntries(string filePath)
         {
             try
             {
@@ -193,6 +224,16 @@ namespace Xunit.Harness
         /// </summary>
         internal static void TryWriteDotNetEntriesToFile(string filePath)
         {
+            if (IsRunningInCi())
+            {
+                return;
+            }
+
+            RunBoundedOrAbandon(filePath, () => CollectDotNetEntries(filePath));
+        }
+
+        private static void CollectDotNetEntries(string filePath)
+        {
             try
             {
                 var dotNetEntries = new HashSet<FeedbackItemDotNetEntry>();
@@ -241,6 +282,38 @@ namespace Xunit.Harness
             {
                 File.WriteAllText(filePath, ex.ToString());
             }
+        }
+
+        /// <summary>
+        /// Run a synchronous event-log scan on a background thread and abandon it if it doesn't complete
+        /// within <see cref="EventLogScanTimeout"/>. The underlying EvtRender P/Invoke is not cancellable,
+        /// so when we abandon we just stop waiting — the worker thread lingers until the API returns or
+        /// the test host is reaped. Returns <see langword="true"/> if the scan finished in time.
+        /// </summary>
+        private static bool RunBoundedOrAbandon(string filePath, Action scan)
+        {
+            // Task.Run hops to the thread pool so the calling thread (typically a WPF dispatcher
+            // thread holding test-collection locks) doesn't block synchronously inside EvtRender.
+            var task = Task.Run(scan);
+#pragma warning disable VSTHRD002 // The whole point of this helper is to bound a synchronous wait.
+            if (task.Wait(EventLogScanTimeout))
+            {
+                return true;
+            }
+#pragma warning restore VSTHRD002
+
+            try
+            {
+                var message = $"Event log scan exceeded {EventLogScanTimeout.TotalSeconds:0}s and was abandoned to avoid wedging the test host. "
+                    + "This typically means the Application event log is unusually slow to enumerate (large log, slow provider, or a busy CI image).";
+                File.WriteAllText(filePath, message);
+            }
+            catch
+            {
+                // Swallow — the abandoned worker will rewrite this file if/when it returns.
+            }
+
+            return false;
         }
 
         /// <summary>
