@@ -369,7 +369,7 @@ namespace Xunit.Harness
                             try
                             {
                                 using var logReader = new StreamReader(new FileStream(installerLogPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete));
-                                installerLogText = logReader.ReadToEnd();
+                                installerLogText = await logReader.ReadToEndAsync();
                                 messageBuilder.AppendLine(installerLogText);
                             }
                             catch (Exception logEx)
@@ -399,7 +399,7 @@ namespace Xunit.Harness
                                 try
                                 {
                                     using var ddReader = new StreamReader(new FileStream(ddLog.FullName, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete));
-                                    messageBuilder.AppendLine(ddReader.ReadToEnd());
+                                    messageBuilder.AppendLine(await ddReader.ReadToEndAsync());
                                 }
                                 catch (Exception ddEx)
                                 {
