@@ -29,6 +29,7 @@
   </ItemGroup>
 
   <ItemGroup>
+    <PackageReference Include="MessagePack" />
     <PackageReference Include="Microsoft.VSSDK.BuildTools" VersionOverride="17.14.2094" PrivateAssets="all" />
     <PackageReference Include="Microsoft.VisualStudio.SDK" VersionOverride="17.14.40265" PrivateAssets="all" />
     <!--

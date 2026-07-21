@@ -16,6 +16,7 @@
   </ItemGroup>
 
   <ItemGroup>
+    <PackageReference Include="MessagePack" />
     <PackageReference Include="Microsoft.VisualStudio.SDK" VersionOverride="17.0.0-previews-3-31605-261" PrivateAssets="all" />
     <PackageReference Include="Microsoft.VisualStudio.Setup.Configuration.Interop" VersionOverride="1.16.30" PrivateAssets="compile" />
     <PackageReference Include="Microsoft.Windows.CsWin32" PrivateAssets="all" />
