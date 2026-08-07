@@ -13,6 +13,8 @@ namespace Xunit.Harness
     using System.Runtime.Remoting.Channels;
     using System.Runtime.Remoting.Channels.Ipc;
     using System.Runtime.Serialization.Formatters;
+    using System.Threading;
+    using System.Threading.Tasks;
     using Microsoft.VisualStudio.IntegrationTestService;
     using Windows.Win32;
     using Windows.Win32.Foundation;
@@ -23,6 +25,14 @@ namespace Xunit.Harness
 
     internal class VisualStudioInstance
     {
+        /// <summary>
+        /// Upper bound on any single remoting call made while shutting an instance down. The calls
+        /// marshal onto the host's UI thread with no timeout of their own, so a devenv wedged at
+        /// shutdown would otherwise block <see cref="Close"/> forever and keep the
+        /// <see cref="CloseHostProcess"/> kill fallback from ever running.
+        /// </summary>
+        private const int ShutdownRemotingCallTimeoutMilliseconds = 10000;
+
         private readonly IntegrationService _integrationService;
         private readonly IpcChannel _integrationServiceChannel;
         private readonly VisualStudio_InProc _inProc;
@@ -219,17 +229,24 @@ namespace Xunit.Harness
 
             CleanUp();
 
-            CloseRemotingService();
-
-            if (exitHostProcess)
+            try
             {
-                CloseHostProcess();
+                CloseRemotingService();
+            }
+            finally
+            {
+                if (exitHostProcess)
+                {
+                    CloseHostProcess();
+                }
             }
         }
 
         private void CloseHostProcess()
         {
-            _inProc.Quit();
+            // Quit only posts the Exit command, but the remoting round-trip itself can hang if the
+            // host's UI thread is wedged; bound it so the kill fallback below stays reachable.
+            TryRemotingCallWithTimeout(_inProc.Quit, ShutdownRemotingCallTimeoutMilliseconds);
             if (!HostProcess.WaitForExit(milliseconds: 10000))
             {
                 IntegrationHelper.KillProcess(HostProcess);
@@ -240,7 +257,7 @@ namespace Xunit.Harness
         {
             try
             {
-                StopRemoteIntegrationService();
+                TryRemotingCallWithTimeout(StopRemoteIntegrationService, ShutdownRemotingCallTimeoutMilliseconds);
             }
             finally
             {
@@ -249,6 +266,39 @@ namespace Xunit.Harness
                 {
                     ChannelServices.UnregisterChannel(_integrationServiceChannel);
                 }
+            }
+        }
+
+        /// <summary>
+        /// Runs a synchronous remoting call into the host process, giving up after
+        /// <paramref name="timeoutMilliseconds"/>. On timeout the blocked call is abandoned (its
+        /// thread pool thread stays blocked until the test process exits) and the caller proceeds,
+        /// ultimately to <see cref="IntegrationHelper.KillProcess(Process)"/>. A call that faults
+        /// because the channel or host is already dead is treated the same way.
+        /// </summary>
+        private static bool TryRemotingCallWithTimeout(Action remotingCall, int timeoutMilliseconds)
+        {
+            var task = Task.Run(remotingCall);
+
+            // Observe any late/faulted result so an abandoned call can't surface as an unobserved
+            // task exception after this method has already given up on it.
+            _ = task.ContinueWith(
+                t => _ = t.Exception,
+                CancellationToken.None,
+                TaskContinuationOptions.OnlyOnFaulted,
+                TaskScheduler.Default);
+
+            try
+            {
+                // This is client-side code in the test process with no JoinableTaskFactory and no UI
+                // thread to deadlock with; a bounded synchronous wait is the point of this helper.
+#pragma warning disable VSTHRD002 // Avoid problematic synchronous waits
+                return task.Wait(timeoutMilliseconds);
+#pragma warning restore VSTHRD002 // Avoid problematic synchronous waits
+            }
+            catch (AggregateException)
+            {
+                return false;
             }
         }
 
