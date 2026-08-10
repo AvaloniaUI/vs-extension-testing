@@ -17,6 +17,8 @@ namespace Xunit.Harness
     {
         private static readonly ConditionalWeakTable<Exception, StrongBox<bool>> LoggedExceptions = new();
         private static readonly object _flakyReportLock = new object();
+        private static readonly object _phaseLogLock = new object();
+        private static readonly Stopwatch _harnessClock = Stopwatch.StartNew();
         private static ImmutableList<CustomLoggerData> _customInProcessLoggers = ImmutableList<CustomLoggerData>.Empty;
         private static bool _firstChanceExceptionHandlerInstalled;
 
@@ -315,6 +317,50 @@ namespace Xunit.Harness
             catch
             {
                 // Never let flaky-report bookkeeping interfere with test execution.
+            }
+        }
+
+        /// <summary>
+        /// Records a harness lifecycle milestone (bootstrap phase start/end, IDE handshake, phase
+        /// timeout) with the elapsed time since the harness started.
+        /// </summary>
+        /// <remarks>
+        /// <para>The rest of this class logs progress with <see cref="Debug.WriteLine(string)"/>, which is
+        /// <c>[Conditional("DEBUG")]</c> and therefore compiled out of the Release binaries CI
+        /// runs — so bootstrap has historically been completely invisible. That matters because
+        /// bootstrap emits no test events, so vstest's <c>--blame-hang-timeout</c> counts the whole
+        /// of it as inactivity: a run that dies during bootstrap produces a hang dump and the
+        /// message "Test host process crashed" with no indication of which phase was slow.</para>
+        /// <para>Written to <c>bootstrap-timeline.log</c> in the log directory (uploaded by CI
+        /// alongside the other failure-state captures) and echoed to the console for the local and
+        /// verbose-logging cases.</para>
+        /// </remarks>
+        internal static void RecordHarnessPhase(string message)
+        {
+            var line = $"[{_harnessClock.Elapsed:hh\\:mm\\:ss} {DateTimeOffset.UtcNow:HH:mm:ss}] {message}";
+
+            try
+            {
+                Console.WriteLine($"[vs-harness] {line}");
+            }
+            catch
+            {
+                // A redirected/closed console must never take down the harness.
+            }
+
+            try
+            {
+                var logDir = GetLogDirectory();
+                Directory.CreateDirectory(logDir);
+
+                lock (_phaseLogLock)
+                {
+                    File.AppendAllText(Path.Combine(logDir, "bootstrap-timeline.log"), line + Environment.NewLine);
+                }
+            }
+            catch
+            {
+                // Never let phase bookkeeping interfere with test execution.
             }
         }
 

@@ -25,6 +25,34 @@ namespace Xunit.Harness
         private static readonly TimeSpan ReportTimeInterval = TimeSpan.FromMinutes(ReportTimeMinute);
         private static readonly Dictionary<Version, Assembly> _installerAssemblies = new Dictionary<Version, Assembly>();
 
+        /// <summary>
+        /// Upper bound on a single bootstrap child process (VSIXInstaller, or one of the
+        /// <c>devenv.exe /clearcache</c>, <c>/updateconfiguration</c>, <c>/resetsettings</c>
+        /// invocations).
+        /// </summary>
+        /// <remarks>
+        /// These were unbounded <see cref="Process.WaitForExit()"/> calls. Bootstrap emits no test
+        /// events, so vstest's blame collector counts all of it as inactivity — one wedged child
+        /// was indistinguishable from every child merely being slow, and both surfaced as a
+        /// 12-minute hang dump with zero tests run. Sized so a phase that is simply slow on a cold
+        /// runner still completes: the whole bootstrap is normally 6-10 minutes across five phases.
+        /// </remarks>
+        private static readonly TimeSpan BootstrapPhaseTimeout = TimeSpan.FromMinutes(4);
+
+        /// <summary>
+        /// Upper bound on waiting for a freshly launched devenv to publish its DTE in the running
+        /// object table. Exceeding it means the IDE is wedged or dead rather than slow, and is
+        /// recovered by killing and relaunching it once.
+        /// </summary>
+        private static readonly TimeSpan DteHandshakeTimeout = TimeSpan.FromMinutes(4);
+
+        /// <summary>
+        /// Upper bound on re-acquiring the DTE for an instance the harness is about to reuse. The
+        /// process is known to be running and previously answered, so a short ceiling is enough;
+        /// blowing it means the IDE wedged during the preceding test collection.
+        /// </summary>
+        private static readonly TimeSpan DteReacquireTimeout = TimeSpan.FromMinutes(1);
+
         private readonly bool _leaveRunning;
 
         /// <summary>
@@ -146,8 +174,15 @@ namespace Xunit.Harness
 
                 hostProcess = await StartNewVisualStudioProcessAsync(installationPath, version, rootSuffix, environmentVariables, extensionFiles, instanceId).ConfigureAwait(true);
 
-                // We wait until the DTE instance is up before we're good
-                dte = await IntegrationHelper.WaitForNotNullAsync(() => IntegrationHelper.TryLocateDteForProcess(hostProcess)).ConfigureAwait(true);
+                // We wait until the DTE instance is up before we're good. If it never appears the
+                // IDE is wedged or dead rather than slow, so kill it and launch once more — a
+                // silent wedge here otherwise consumes the entire blame-hang budget without a
+                // single test having run.
+                var handshake = await WaitForDteWithRelaunchAsync(
+                    hostProcess,
+                    () => StartNewVisualStudioProcessAsync(installationPath, version, rootSuffix, environmentVariables, extensionFiles, instanceId)).ConfigureAwait(true);
+                hostProcess = handshake.HostProcess;
+                dte = handshake.Dte;
             }
             else
             {
@@ -160,7 +195,16 @@ namespace Xunit.Harness
                 Debug.Assert(_currentlyRunningInstance != null, "Assertion failed: _currentlyRunningInstance != null");
 
                 hostProcess = _currentlyRunningInstance!.HostProcess;
-                dte = await IntegrationHelper.WaitForNotNullAsync(() => IntegrationHelper.TryLocateDteForProcess(hostProcess)).ConfigureAwait(true);
+
+                // Bounded: this instance already answered once, so a stall here means it wedged
+                // during the preceding test collection. Failing fast lets the assembly runner's
+                // retry loop tear it down and start a clean instance, instead of going silent
+                // until the blame collector aborts the whole run.
+                dte = await IntegrationHelper.WaitForNotNullAsync(
+                    () => IntegrationHelper.TryLocateDteForProcess(hostProcess),
+                    DteReacquireTimeout,
+                    hostProcess,
+                    $"DTE for reused devenv (PID {hostProcess.Id})").ConfigureAwait(true);
                 actualVersion = _currentlyRunningInstance.Version;
                 supportedPackageIds = _currentlyRunningInstance.SupportedPackageIds;
                 installationPath = _currentlyRunningInstance.InstallationPath;
@@ -300,6 +344,164 @@ namespace Xunit.Harness
                                 "There were no instances of Visual Studio found that match the specified requirements.");
         }
 
+        /// <summary>
+        /// Waits for <paramref name="hostProcess"/> to publish its DTE, and on failure kills it and
+        /// relaunches once via <paramref name="relaunch"/> before giving up.
+        /// </summary>
+        /// <returns>The process that answered and its DTE — not necessarily the process passed in,
+        /// since a relaunch replaces it.</returns>
+        /// <remarks>Returns a class rather than a tuple because this file is also compiled into the
+        /// Legacy harness, whose target framework predates <c>System.ValueTuple</c>.</remarks>
+        private static async Task<DteHandshakeResult> WaitForDteWithRelaunchAsync(Process hostProcess, Func<Task<Process>> relaunch)
+        {
+            for (var attempt = 1; ; attempt++)
+            {
+                DataCollectionService.RecordHarnessPhase($"dte-handshake: waiting for devenv (PID {hostProcess.Id}), attempt {attempt} of 2");
+
+                try
+                {
+                    var dte = await IntegrationHelper.WaitForNotNullAsync(
+                        () => IntegrationHelper.TryLocateDteForProcess(hostProcess),
+                        DteHandshakeTimeout,
+                        hostProcess,
+                        $"DTE for devenv (PID {hostProcess.Id})").ConfigureAwait(true);
+
+                    DataCollectionService.RecordHarnessPhase($"dte-handshake: devenv (PID {hostProcess.Id}) ready");
+                    return new DteHandshakeResult(hostProcess, dte);
+                }
+                catch (Exception e) when (e is TimeoutException or InvalidOperationException)
+                {
+                    DataCollectionService.RecordHarnessPhase($"dte-handshake: FAILED for devenv (PID {hostProcess.Id}) — {e.Message}");
+
+                    if (attempt >= 2)
+                    {
+                        throw;
+                    }
+
+                    // Capture what the desktop looked like before tearing the wedged IDE down: a
+                    // modal dialog (crash prompt, licence prompt, first-run notice) blocking startup
+                    // is invisible in every other artifact.
+                    TryTakeScreenshot($"dte-handshake-failure-{hostProcess.Id}");
+                    IntegrationHelper.KillProcess(hostProcess);
+
+                    DataCollectionService.RecordHarnessPhase("dte-handshake: relaunching devenv after failed handshake");
+                    hostProcess = await relaunch().ConfigureAwait(true);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Runs a bootstrap child process to completion under <see cref="BootstrapPhaseTimeout"/>,
+        /// recording how long it took. On timeout the process is screenshotted, killed, and started
+        /// once more; a second timeout throws so the phase is named in the failure rather than
+        /// disappearing into a blame hang dump.
+        /// </summary>
+        /// <param name="phase">Phase name used for logging and screenshot folders.</param>
+        /// <param name="start">Starts the process. Called again for the retry.</param>
+        private static void RunBootstrapPhase(string phase, Func<Process> start)
+        {
+            for (var attempt = 1; ; attempt++)
+            {
+                DataCollectionService.RecordHarnessPhase($"{phase}: starting (attempt {attempt} of 2)");
+                var stopwatch = Stopwatch.StartNew();
+
+                using var process = start();
+                if (WaitForBootstrapProcessExit(process, phase, BootstrapPhaseTimeout))
+                {
+                    DataCollectionService.RecordHarnessPhase($"{phase}: completed in {stopwatch.Elapsed:mm\\:ss} with exit code {process.ExitCode}");
+                    return;
+                }
+
+                DataCollectionService.RecordHarnessPhase($"{phase}: TIMED OUT after {stopwatch.Elapsed:mm\\:ss} (limit {BootstrapPhaseTimeout.TotalMinutes:0.#}m)");
+                TryTakeScreenshot($"{phase}-timeout");
+                IntegrationHelper.KillProcess(process);
+
+                if (attempt >= 2)
+                {
+                    throw new TimeoutException(
+                        $"Visual Studio bootstrap phase '{phase}' did not complete within {BootstrapPhaseTimeout.TotalMinutes:0.#} minute(s) on either attempt. " +
+                        "The instance was killed after each attempt; see bootstrap-timeline.log and the screenshots alongside it.");
+                }
+            }
+        }
+
+        /// <summary>
+        /// Runs VSIXInstaller for a single extension under <see cref="BootstrapPhaseTimeout"/>,
+        /// retrying once if it wedges. VSIXInstaller is re-runnable (<c>/quiet</c> against the same
+        /// hive), so a second attempt is safe and is usually what recovers a run where the first
+        /// attempt hit a locked file left by an earlier force-killed devenv.
+        /// </summary>
+        /// <returns>The exited process together with its still-pending output readers, so the
+        /// caller can inspect the exit code and inline the diagnostics on failure.</returns>
+        private static VsixInstallResult RunVsixInstaller(
+            string vsixInstallerExeFile,
+            string arguments,
+            string extension,
+            Func<string, bool, string, ProcessStartInfo> createStartInfo)
+        {
+            var extensionName = Path.GetFileName(extension);
+
+            for (var attempt = 1; ; attempt++)
+            {
+                DataCollectionService.RecordHarnessPhase($"vsix-install: installing '{extensionName}' (attempt {attempt} of 2)");
+                var stopwatch = Stopwatch.StartNew();
+
+                var installProcessStartInfo = createStartInfo(vsixInstallerExeFile, true, arguments);
+                installProcessStartInfo.RedirectStandardError = true;
+                installProcessStartInfo.RedirectStandardOutput = true;
+
+                var installProcess = Process.Start(installProcessStartInfo);
+                var standardErrorAsync = installProcess.StandardError.ReadToEndAsync();
+                var standardOutputAsync = installProcess.StandardOutput.ReadToEndAsync();
+
+                if (WaitForBootstrapProcessExit(installProcess, "vsix-install", BootstrapPhaseTimeout))
+                {
+                    DataCollectionService.RecordHarnessPhase($"vsix-install: '{extensionName}' finished in {stopwatch.Elapsed:mm\\:ss} with exit code {installProcess.ExitCode}");
+                    return new VsixInstallResult(installProcess, standardErrorAsync, standardOutputAsync);
+                }
+
+                DataCollectionService.RecordHarnessPhase($"vsix-install: TIMED OUT installing '{extensionName}' after {stopwatch.Elapsed:mm\\:ss} (limit {BootstrapPhaseTimeout.TotalMinutes:0.#}m)");
+                TryTakeScreenshot("vsix-install-timeout");
+                IntegrationHelper.KillProcess(installProcess);
+
+                // The abandoned readers complete (or fault) once the killed process's pipes close;
+                // observe them so neither can resurface as an unobserved task exception.
+                ObserveFailure(standardErrorAsync);
+                ObserveFailure(standardOutputAsync);
+                installProcess.Dispose();
+
+                if (attempt >= 2)
+                {
+                    throw new TimeoutException(
+                        $"VSIXInstaller did not finish installing '{extensionName}' within {BootstrapPhaseTimeout.TotalMinutes:0.#} minute(s) on either attempt. " +
+                        "See bootstrap-timeline.log and the vsix-install-timeout screenshots alongside it.");
+                }
+            }
+        }
+
+        /// <summary>Observes a task's exception so an abandoned task can't surface as unobserved.</summary>
+        private static void ObserveFailure(Task task)
+        {
+            _ = task.ContinueWith(
+                t => _ = t.Exception,
+                CancellationToken.None,
+                TaskContinuationOptions.OnlyOnFaulted,
+                TaskScheduler.Default);
+        }
+
+        private static void TryTakeScreenshot(string name)
+        {
+            try
+            {
+                var directory = Path.GetFullPath(DataCollectionService.GetLogDirectory());
+                ScreenshotService.TakeScreenshot(Path.Combine(directory, name, "_at_failure.png"));
+            }
+            catch
+            {
+                // Diagnostics only — never mask the failure being diagnosed.
+            }
+        }
+
         private static async Task<Process> StartNewVisualStudioProcessAsync(string installationPath, Version version, string? rootSuffix, ImmutableDictionary<string, string> environmentVariables, ImmutableList<string> extensionFiles, string vsInstanceId)
         {
             var vsExeFile = Path.Combine(installationPath, @"Common7\IDE\devenv.exe");
@@ -334,13 +536,10 @@ namespace Xunit.Harness
                     var arguments = string.Join(" ", baseArguments.Add($"\"{extension}\""));
                     Debug.WriteLine($"{vsixInstallerExeFile} {arguments}");
 
-                    var installProcessStartInfo = CreateStartInfo(vsixInstallerExeFile, silent: true, arguments);
-                    installProcessStartInfo.RedirectStandardError = true;
-                    installProcessStartInfo.RedirectStandardOutput = true;
-                    using var installProcess = Process.Start(installProcessStartInfo);
-                    var standardErrorAsync = installProcess.StandardError.ReadToEndAsync();
-                    var standardOutputAsync = installProcess.StandardOutput.ReadToEndAsync();
-                    installProcess.WaitForExit();
+                    var install = RunVsixInstaller(vsixInstallerExeFile, arguments, extension, CreateStartInfo);
+                    using var installProcess = install.Process;
+                    var standardErrorAsync = install.StandardError;
+                    var standardOutputAsync = install.StandardOutput;
 
                     if (installProcess.ExitCode != 0)
                     {
@@ -464,7 +663,9 @@ namespace Xunit.Harness
             if (version.Major >= 16)
             {
                 // Make sure the start window doesn't show on launch
-                Process.Start(CreateStartInfo(vsRegEditExeFile, silent: true, $"set \"{installationPath}\" \"{rootSuffix}\" HKCU General OnEnvironmentStartup dword 10")).WaitForExit();
+                RunBootstrapPhase(
+                    "vsregedit",
+                    () => Process.Start(CreateStartInfo(vsRegEditExeFile, silent: true, $"set \"{installationPath}\" \"{rootSuffix}\" HKCU General OnEnvironmentStartup dword 10")));
             }
 
             var vsLaunchArgs = string.Empty;
@@ -477,15 +678,12 @@ namespace Xunit.Harness
             //      So, run clearcache and updateconfiguration to workaround https://devdiv.visualstudio.com/DevDiv/_workitems?id=385351.
             if (version.Major >= 12)
             {
-                var clearCacheProcess = Process.Start(CreateStartInfo(vsExeFile, silent: true, $"/clearcache {vsLaunchArgs}"));
-                TakeSnapshotEveryTimeSpanUntilProcessExit(clearCacheProcess, "clearcache");
+                RunBootstrapPhase("clearcache", () => Process.Start(CreateStartInfo(vsExeFile, silent: true, $"/clearcache {vsLaunchArgs}")));
             }
 
-            var updateConfigProcess = Process.Start(CreateStartInfo(vsExeFile, silent: true, $"/updateconfiguration {vsLaunchArgs}"));
-            TakeSnapshotEveryTimeSpanUntilProcessExit(updateConfigProcess, "updateconfiguration");
+            RunBootstrapPhase("updateconfiguration", () => Process.Start(CreateStartInfo(vsExeFile, silent: true, $"/updateconfiguration {vsLaunchArgs}")));
 
-            var resetSettingsProcess = Process.Start(CreateStartInfo(vsExeFile, silent: true, $"/resetsettings General.vssettings /command \"File.Exit\" {vsLaunchArgs}"));
-            TakeSnapshotEveryTimeSpanUntilProcessExit(resetSettingsProcess, "resetsettings");
+            RunBootstrapPhase("resetsettings", () => Process.Start(CreateStartInfo(vsExeFile, silent: true, $"/resetsettings General.vssettings /command \"File.Exit\" {vsLaunchArgs}")));
 
             // Make sure we kill any leftover processes spawned by the host
             IntegrationHelper.KillProcess("DbgCLR");
@@ -495,9 +693,9 @@ namespace Xunit.Harness
             var process = Process.Start(CreateStartInfo(vsExeFile, silent: false, vsLaunchArgs));
 
             // Run the snapshot collection operation, but don't block on its completion for the actual test execution
-            _ = Task.Run(() => TakeSnapshotEveryTimeSpanUntilProcessExit(process, $"devenv{process.Id}"));
+            StartPeriodicScreenshotsUntilExit(process, $"devenv{process.Id}");
 
-            Debug.WriteLine($"Launched a new instance of Visual Studio. (ID: {process.Id})");
+            DataCollectionService.RecordHarnessPhase($"devenv-launch: launched Visual Studio (PID {process.Id})");
 
             return process;
 
@@ -568,35 +766,70 @@ namespace Xunit.Harness
             }
         }
 
-        private static void TakeSnapshotEveryTimeSpanUntilProcessExit(Process process, string commandBeingExecuted)
+        /// <summary>
+        /// Starts periodic screenshots of the desktop for the lifetime of <paramref name="process"/>
+        /// without blocking the caller. Used for the IDE itself, which is expected to outlive
+        /// bootstrap and run for the whole test session.
+        /// </summary>
+        private static void StartPeriodicScreenshotsUntilExit(Process process, string commandBeingExecuted)
         {
-            var dir = DataCollectionService.GetLogDirectory();
-            if (!Directory.Exists(dir))
+            _ = Task.Run(() =>
             {
-                Directory.CreateDirectory(dir);
-            }
+                using var cancellationTokenSource = new CancellationTokenSource();
+                try
+                {
+                    _ = Task.Run(() => TakeScreenShotEveryTimeIntervalAsync(commandBeingExecuted, cancellationTokenSource.Token));
+                    process.WaitForExit();
+                }
+                finally
+                {
+                    cancellationTokenSource.Cancel();
+                }
+            });
+        }
 
-            using var cancellatokenSource = new CancellationTokenSource();
+        /// <summary>
+        /// Waits for <paramref name="process"/> to exit, taking a screenshot every
+        /// <see cref="ReportTimeInterval"/> while it runs, and giving up after
+        /// <paramref name="timeout"/>.
+        /// </summary>
+        /// <returns><see langword="true"/> if the process exited within the timeout.</returns>
+        private static bool WaitForBootstrapProcessExit(Process process, string commandBeingExecuted, TimeSpan timeout)
+        {
+            using var cancellationTokenSource = new CancellationTokenSource();
 
             try
             {
-                _ = Task.Run(() => TakeScreenShotEveryTimeIntervalAsync(dir, commandBeingExecuted, cancellatokenSource.Token));
-                process.WaitForExit();
+                _ = Task.Run(() => TakeScreenShotEveryTimeIntervalAsync(commandBeingExecuted, cancellationTokenSource.Token));
+                return process.WaitForExit((int)timeout.TotalMilliseconds);
             }
             finally
             {
-                cancellatokenSource.Cancel();
+                cancellationTokenSource.Cancel();
             }
+        }
 
-            static async Task TakeScreenShotEveryTimeIntervalAsync(string directory, string commandBeingExecuted, CancellationToken cancellationToken)
+        /// <summary>
+        /// Screenshots the desktop every <see cref="ReportTimeInterval"/> until cancelled. Used for
+        /// the long-lived IDE process, whose lifetime is the whole test run.
+        /// </summary>
+        private static async Task TakeScreenShotEveryTimeIntervalAsync(string commandBeingExecuted, CancellationToken cancellationToken)
+        {
+            var directory = Path.GetFullPath(DataCollectionService.GetLogDirectory());
+            var count = 1;
+            while (!cancellationToken.IsCancellationRequested)
             {
-                var count = 1;
-                while (!cancellationToken.IsCancellationRequested)
+                try
                 {
                     await Task.Delay(ReportTimeInterval, cancellationToken).ConfigureAwait(false);
-                    ScreenshotService.TakeScreenshot(Path.Combine(Path.GetFullPath(directory), commandBeingExecuted, $"_after_{count * ReportTimeMinute}_min.png"));
-                    count++;
                 }
+                catch (OperationCanceledException)
+                {
+                    return;
+                }
+
+                ScreenshotService.TakeScreenshot(Path.Combine(directory, commandBeingExecuted, $"_after_{count * ReportTimeMinute}_min.png"));
+                count++;
             }
         }
 
@@ -619,6 +852,37 @@ namespace Xunit.Harness
         public override object? InitializeLifetimeService()
         {
             return null;
+        }
+
+        /// <summary>A devenv process that has published its DTE, paired with that DTE.</summary>
+        private sealed class DteHandshakeResult
+        {
+            public DteHandshakeResult(Process hostProcess, DTE dte)
+            {
+                HostProcess = hostProcess;
+                Dte = dte;
+            }
+
+            public Process HostProcess { get; }
+
+            public DTE Dte { get; }
+        }
+
+        /// <summary>An exited VSIXInstaller process and its pending output readers.</summary>
+        private sealed class VsixInstallResult
+        {
+            public VsixInstallResult(Process process, Task<string> standardError, Task<string> standardOutput)
+            {
+                Process = process;
+                StandardError = standardError;
+                StandardOutput = standardOutput;
+            }
+
+            public Process Process { get; }
+
+            public Task<string> StandardError { get; }
+
+            public Task<string> StandardOutput { get; }
         }
     }
 }

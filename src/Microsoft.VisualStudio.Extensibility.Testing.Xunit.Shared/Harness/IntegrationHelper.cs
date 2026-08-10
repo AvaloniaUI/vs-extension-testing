@@ -18,6 +18,13 @@ namespace Xunit.Harness
     internal static class IntegrationHelper
     {
         /// <summary>
+        /// Interval between readiness probes in <see cref="WaitForNotNullAsync{T}"/>. Long enough
+        /// that polling doesn't compete with the process being waited on for CPU, short enough not
+        /// to add meaningful latency to a handshake measured in seconds.
+        /// </summary>
+        private static readonly TimeSpan PollInterval = TimeSpan.FromMilliseconds(250);
+
+        /// <summary>
         /// Kills the specified process if it is not <see langword="null"/> and has not already exited.
         /// </summary>
         public static void KillProcess(Process process)
@@ -86,18 +93,58 @@ namespace Xunit.Harness
             return (DTE)dte;
         }
 
-        public static async Task<T> WaitForNotNullAsync<T>(Func<T?> action)
+        /// <summary>
+        /// Polls <paramref name="action"/> until it returns a value, giving up after
+        /// <paramref name="timeout"/>.
+        /// </summary>
+        /// <typeparam name="T">The type of value being waited for.</typeparam>
+        /// <param name="action">The probe to run. Expected to be cheap but not free — it is
+        /// throttled by <see cref="PollInterval"/> rather than run in a tight loop.</param>
+        /// <param name="timeout">Upper bound on the total wait.</param>
+        /// <param name="liveness">The process whose readiness is being awaited. Checked on every
+        /// iteration so a host that dies (or never starts) fails immediately instead of being
+        /// waited on for the full <paramref name="timeout"/>.</param>
+        /// <param name="description">Human-readable description of what is being awaited, used in
+        /// the failure messages.</param>
+        /// <returns>The first non-<see langword="null"/> result.</returns>
+        /// <exception cref="TimeoutException">No value was produced within <paramref name="timeout"/>.</exception>
+        /// <exception cref="InvalidOperationException"><paramref name="liveness"/> exited while waiting.</exception>
+        /// <remarks>
+        /// This used to be an unbounded <c>while (result == null) await Task.Yield();</c> loop. That
+        /// had two failure modes on CI: a devenv that never registered its DTE (crashed at startup,
+        /// blocked on a modal dialog, wedged loading packages) parked the harness forever with no
+        /// test event, which vstest's blame collector reports as a 12-minute inactivity hang; and
+        /// the yield-only loop saturated a core enumerating the running object table over COM,
+        /// starving the very process it was waiting for on a small CI runner.
+        /// </remarks>
+        public static async Task<T> WaitForNotNullAsync<T>(Func<T?> action, TimeSpan timeout, Process? liveness = null, string? description = null)
             where T : class
         {
-            var result = action();
+            var label = description ?? typeof(T).Name;
+            var stopwatch = Stopwatch.StartNew();
 
-            while (result == null)
+            while (true)
             {
-                await Task.Yield();
-                result = action();
-            }
+                var result = action();
+                if (result != null)
+                {
+                    return result;
+                }
 
-            return result;
+                if (liveness?.HasExited == true)
+                {
+                    throw new InvalidOperationException(
+                        $"The process hosting '{label}' (PID {liveness.Id}) exited with code {liveness.ExitCode} after {stopwatch.Elapsed:mm\\:ss} without ever becoming available.");
+                }
+
+                if (stopwatch.Elapsed >= timeout)
+                {
+                    throw new TimeoutException(
+                        $"'{label}' did not become available within {timeout.TotalMinutes:0.#} minute(s).");
+                }
+
+                await Task.Delay(PollInterval).ConfigureAwait(false);
+            }
         }
     }
 }
