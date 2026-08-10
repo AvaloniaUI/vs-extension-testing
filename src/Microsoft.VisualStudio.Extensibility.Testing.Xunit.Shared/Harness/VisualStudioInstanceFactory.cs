@@ -53,6 +53,23 @@ namespace Xunit.Harness
         /// </summary>
         private static readonly TimeSpan DteReacquireTimeout = TimeSpan.FromMinutes(1);
 
+        /// <summary>
+        /// How long to wait for Windows to reap a bootstrap process the harness has just killed.
+        /// </summary>
+        private static readonly TimeSpan KilledProcessReapTimeout = TimeSpan.FromSeconds(20);
+
+        /// <summary>
+        /// Pause after a killed process has been reaped, before the phase is attempted again.
+        /// </summary>
+        /// <remarks>
+        /// A killed process keeps its file handles until the OS has finished tearing it down, and
+        /// VSIXInstaller is killed mid-way through writing extension files. Retrying immediately
+        /// fails with <c>ERROR_SHARING_VIOLATION</c> (0x80070020) within seconds — observed on
+        /// AvaloniaUI.DeveloperSuite run 31375966237, where the retry died in 5 seconds and only
+        /// the outer attempt loop's full re-bootstrap recovered the run.
+        /// </remarks>
+        private static readonly TimeSpan PostKillSettleDelay = TimeSpan.FromSeconds(10);
+
         private readonly bool _leaveRunning;
 
         /// <summary>
@@ -414,7 +431,7 @@ namespace Xunit.Harness
 
                 DataCollectionService.RecordHarnessPhase($"{phase}: TIMED OUT after {stopwatch.Elapsed:mm\\:ss} (limit {BootstrapPhaseTimeout.TotalMinutes:0.#}m)");
                 DataCollectionService.TryCaptureScreenshot($"{phase}-timeout");
-                IntegrationHelper.KillProcess(process);
+                KillAndSettle(process, phase);
 
                 if (attempt >= 2)
                 {
@@ -437,6 +454,7 @@ namespace Xunit.Harness
             string vsixInstallerExeFile,
             string arguments,
             string extension,
+            string installerLogPath,
             Func<string, bool, string, ProcessStartInfo> createStartInfo)
         {
             var extensionName = Path.GetFileName(extension);
@@ -462,7 +480,13 @@ namespace Xunit.Harness
 
                 DataCollectionService.RecordHarnessPhase($"vsix-install: TIMED OUT installing '{extensionName}' after {stopwatch.Elapsed:mm\\:ss} (limit {BootstrapPhaseTimeout.TotalMinutes:0.#}m)");
                 DataCollectionService.TryCaptureScreenshot("vsix-install-timeout");
-                IntegrationHelper.KillProcess(installProcess);
+
+                // VSIXInstaller's own log says whether the install work finished before the process
+                // stopped responding. That distinction is invisible from the outside and decides
+                // whether a timeout here means "install wedged" or "install done, process won't
+                // exit" — the latter being what has actually been observed.
+                RecordInstallerLogTail(installerLogPath);
+                KillAndSettle(installProcess, "vsix-install");
 
                 // The abandoned readers complete (or fault) once the killed process's pipes close;
                 // observe them so neither can resurface as an unobserved task exception.
@@ -476,6 +500,66 @@ namespace Xunit.Harness
                         $"VSIXInstaller did not finish installing '{extensionName}' within {BootstrapPhaseTimeout.TotalMinutes:0.#} minute(s) on either attempt. " +
                         "See bootstrap-timeline.log and the vsix-install-timeout screenshots alongside it.");
                 }
+            }
+        }
+
+        /// <summary>
+        /// Kills a bootstrap process, waits for the OS to reap it, then pauses before the caller
+        /// retries the phase.
+        /// </summary>
+        /// <remarks>
+        /// Killing alone is not enough to make a retry viable: the process keeps its file handles
+        /// until it is fully torn down, so an immediately re-run VSIXInstaller collides with the
+        /// files its predecessor was writing and fails with <c>ERROR_SHARING_VIOLATION</c>.
+        /// </remarks>
+        private static void KillAndSettle(Process process, string phase)
+        {
+            try
+            {
+                IntegrationHelper.KillProcess(process);
+
+                if (!process.WaitForExit((int)KilledProcessReapTimeout.TotalMilliseconds))
+                {
+                    DataCollectionService.RecordHarnessPhase(
+                        $"{phase}: killed process {process.Id} still had not exited after {KilledProcessReapTimeout.TotalSeconds:0}s");
+                }
+            }
+            catch (Exception e)
+            {
+                DataCollectionService.RecordHarnessPhase($"{phase}: kill failed — {e.GetType().Name}: {e.Message}");
+            }
+
+            Thread.Sleep(PostKillSettleDelay);
+        }
+
+        /// <summary>
+        /// Records the last few lines of VSIXInstaller's own log, so a timeout says whether the
+        /// install had already completed.
+        /// </summary>
+        private static void RecordInstallerLogTail(string installerLogPath, int lineCount = 4)
+        {
+            try
+            {
+                if (!File.Exists(installerLogPath))
+                {
+                    DataCollectionService.RecordHarnessPhase($"vsix-install: no installer log at '{installerLogPath}'");
+                    return;
+                }
+
+                // The installer still owns this file, so share every access mode it might hold.
+                using var stream = new FileStream(installerLogPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+                using var reader = new StreamReader(stream);
+                var lines = reader.ReadToEnd()
+                    .Split(new[] { "\r\n", "\n" }, StringSplitOptions.RemoveEmptyEntries);
+
+                foreach (var line in lines.Skip(Math.Max(0, lines.Length - lineCount)))
+                {
+                    DataCollectionService.RecordHarnessPhase($"vsix-install: installer log | {line}");
+                }
+            }
+            catch (Exception e)
+            {
+                DataCollectionService.RecordHarnessPhase($"vsix-install: could not read installer log — {e.GetType().Name}: {e.Message}");
             }
         }
 
@@ -523,7 +607,7 @@ namespace Xunit.Harness
                     var arguments = string.Join(" ", baseArguments.Add($"\"{extension}\""));
                     Debug.WriteLine($"{vsixInstallerExeFile} {arguments}");
 
-                    var install = RunVsixInstaller(vsixInstallerExeFile, arguments, extension, CreateStartInfo);
+                    var install = RunVsixInstaller(vsixInstallerExeFile, arguments, extension, Path.Combine(Path.GetTempPath(), logFileName), CreateStartInfo);
                     using var installProcess = install.Process;
                     var standardErrorAsync = install.StandardError;
                     var standardOutputAsync = install.StandardOutput;
