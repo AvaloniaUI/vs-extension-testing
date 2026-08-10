@@ -32,6 +32,29 @@ namespace Xunit.Harness
         /// </summary>
         private static readonly TimeSpan RemoteDisposeTimeout = TimeSpan.FromSeconds(30);
 
+        /// <summary>
+        /// Longest a test collection may run without a single test event before the IDE hosting it
+        /// is treated as wedged rather than busy.
+        /// </summary>
+        /// <remarks>
+        /// <para><c>RunTestCollection</c> is a synchronous .NET Remoting call
+        /// that marshals onto devenv's UI thread. If that thread wedges the call never returns, and
+        /// no in-IDE guard can help — a per-test timeout enforced inside the IDE is wedged along
+        /// with everything else there. The run then goes silent until vstest's blame collector
+        /// aborts the whole test host, discarding the remaining tests and naming nothing.</para>
+        /// <para>Sized to sit between the two: comfortably above the longest legitimate silence
+        /// inside a collection (this repo's in-IDE per-sub-test ceiling is 5 minutes and the
+        /// slowest single observed test is ~2m40s), and below the 12-minute
+        /// <c>--blame-hang-timeout</c> the consuming build passes, so the harness gets to act
+        /// first. It cannot make a run fail that would otherwise have passed: a silence this long
+        /// was already going to be aborted 4 minutes later, just less usefully. If a collection
+        /// ever legitimately needs longer, this and the blame timeout must both rise.</para>
+        /// </remarks>
+        private static readonly TimeSpan StalledCollectionTimeout = TimeSpan.FromMinutes(8);
+
+        /// <summary>How often the stall watchdog re-checks. Cheap; it only reads a timestamp.</summary>
+        private static readonly TimeSpan StalledCollectionPollInterval = TimeSpan.FromSeconds(15);
+
         private HashSet<VisualStudioInstanceKey>? _ideInstancesInTests;
 
         public IdeTestAssemblyRunner(ITestAssembly testAssembly, IEnumerable<IXunitTestCase> testCases, IMessageSink diagnosticMessageSink, IMessageSink executionMessageSink, ITestFrameworkExecutionOptions executionOptions)
@@ -324,16 +347,22 @@ namespace Xunit.Harness
                                 var ipcMessageBus = new IpcMessageBus(messageBus);
                                 marshalledObjects.Add(ipcMessageBus);
 
-                                var result = runner.RunTestCollection(ipcMessageBus, testCollection, testCases.ToArray());
-                                var runSummary = new RunSummary
+                                // RunTestCollection blocks this thread until the IDE has run every
+                                // test in the collection. Watch for the IDE going silent while it
+                                // does; see StartCollectionStallWatchdog.
+                                using (StartCollectionStallWatchdog(executionMessageSinkFilter, visualStudioContext.Instance.HostProcess))
                                 {
-                                    Total = result.Item1,
-                                    Failed = result.Item2,
-                                    Skipped = result.Item3,
-                                    Time = result.Item4,
-                                };
+                                    var result = runner.RunTestCollection(ipcMessageBus, testCollection, testCases.ToArray());
+                                    var runSummary = new RunSummary
+                                    {
+                                        Total = result.Item1,
+                                        Failed = result.Item2,
+                                        Skipped = result.Item3,
+                                        Time = result.Item4,
+                                    };
 
-                                return runSummary;
+                                    return runSummary;
+                                }
                             }
                             finally
                             {
@@ -419,6 +448,75 @@ namespace Xunit.Harness
                     return runSummary;
                 }
             };
+        }
+
+        /// <summary>
+        /// Watches for the IDE going silent during a test collection and, if it does, kills the IDE
+        /// so the blocked <c>RunTestCollection</c> call is released.
+        /// </summary>
+        /// <param name="progress">The execution message sink; every message from the IDE resets its
+        /// stall clock, making it the only reliable liveness signal for work happening in another
+        /// process.</param>
+        /// <param name="hostProcess">The IDE process to kill if the collection stalls.</param>
+        /// <returns>A handle that stops the watchdog when disposed.</returns>
+        /// <remarks>
+        /// Killing the host is the only lever available: the call is a synchronous remoting call
+        /// that cannot be cancelled, so the channel has to be broken for it to return. Once it
+        /// does, the call throws, the surrounding handler captures failure state, records the
+        /// in-flight test as a suspected crasher, and the attempt loop retries it on a fresh
+        /// instance — a named, retryable failure instead of a silent test-host abort.
+        /// </remarks>
+        private static IDisposable StartCollectionStallWatchdog(IpcMessageSink progress, Process hostProcess)
+        {
+            progress.MarkActivity();
+
+            var cancellationTokenSource = new CancellationTokenSource();
+            var cancellationToken = cancellationTokenSource.Token;
+
+            _ = Task.Run(
+                async () =>
+                {
+                    try
+                    {
+                        while (true)
+                        {
+                            await Task.Delay(StalledCollectionPollInterval, cancellationToken).ConfigureAwait(false);
+
+                            if (hostProcess.HasExited)
+                            {
+                                // The channel is already broken, so the call is unblocking on its own.
+                                return;
+                            }
+
+                            var stalledFor = progress.TimeSinceLastMessage;
+                            if (stalledFor < StalledCollectionTimeout)
+                            {
+                                continue;
+                            }
+
+                            var inFlight = progress.CurrentTestCase ?? "(between tests)";
+                            DataCollectionService.RecordHarnessPhase(
+                                $"run-test-collection: STALLED — no test activity for {stalledFor:hh\\:mm\\:ss} " +
+                                $"(limit {StalledCollectionTimeout.TotalMinutes:0.#}m), in-flight test '{inFlight}'. " +
+                                $"Killing devenv (PID {hostProcess.Id}) to release the blocked call.");
+                            DataCollectionService.TryCaptureScreenshot($"run-test-collection-stall-{hostProcess.Id}");
+                            IntegrationHelper.KillProcess(hostProcess);
+                            return;
+                        }
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        // Normal shutdown: the collection finished before the watchdog fired.
+                    }
+                    catch (Exception e)
+                    {
+                        DataCollectionService.RecordHarnessPhase(
+                            $"run-test-collection: watchdog stopped after {e.GetType().Name}: {e.Message}");
+                    }
+                },
+                CancellationToken.None);
+
+            return new CancelOnDispose(cancellationTokenSource);
         }
 
         /// <summary>
@@ -573,6 +671,21 @@ namespace Xunit.Harness
             return VisualStudioInstanceKey.Unspecified;
         }
 
+        /// <summary>Cancels the wrapped source on <see cref="Dispose"/>, stopping a watchdog loop.</summary>
+        private sealed class CancelOnDispose : IDisposable
+        {
+            private readonly CancellationTokenSource _cancellationTokenSource;
+
+            public CancelOnDispose(CancellationTokenSource cancellationTokenSource)
+                => _cancellationTokenSource = cancellationTokenSource;
+
+            public void Dispose()
+            {
+                _cancellationTokenSource.Cancel();
+                _cancellationTokenSource.Dispose();
+            }
+        }
+
         private class IpcMessageSink : MarshalByRefObject, IMessageSink
         {
             private readonly IMessageSink _messageSink;
@@ -582,6 +695,13 @@ namespace Xunit.Harness
             private readonly bool _finalAttempt;
             private readonly HashSet<string> _completedTestCaseIds;
 
+            /// <summary>
+            /// <see cref="DateTime.UtcNow"/> ticks at the last message from the IDE. Written from
+            /// remoting threads and read by the stall watchdog, so it is exchanged atomically
+            /// rather than stored as a <see cref="DateTime"/>.
+            /// </summary>
+            private long _lastMessageTicks;
+
             public IpcMessageSink(IMessageSink messageSink, IReadOnlyDictionary<string, ITestCase> knownTestCasesByUniqueId, bool finalAttempt, HashSet<string> completedTestCaseIds, CancellationToken cancellationToken)
             {
                 _messageSink = messageSink;
@@ -589,6 +709,7 @@ namespace Xunit.Harness
                 _finalAttempt = finalAttempt;
                 _completedTestCaseIds = completedTestCaseIds;
                 _cancellationToken = cancellationToken;
+                MarkActivity();
             }
 
             public string? CurrentTestCase
@@ -603,8 +724,18 @@ namespace Xunit.Harness
                 private set;
             }
 
+            /// <summary>Gets how long it has been since the IDE last sent this sink a message.</summary>
+            public TimeSpan TimeSinceLastMessage
+                => DateTime.UtcNow - new DateTime(Interlocked.Read(ref _lastMessageTicks), DateTimeKind.Utc);
+
+            /// <summary>Resets the stall clock. Called on every message, and once when armed.</summary>
+            public void MarkActivity()
+                => Interlocked.Exchange(ref _lastMessageTicks, DateTime.UtcNow.Ticks);
+
             public bool OnMessage(IMessageSinkMessage message)
             {
+                MarkActivity();
+
                 if (message is ITestAssemblyFinished testAssemblyFinished)
                 {
                     // The test cases in the ITestAssemblyFinished message are remote proxies, but the objects won't be
