@@ -364,6 +364,25 @@ namespace Xunit.Harness
             }
         }
 
+        /// <summary>
+        /// Best-effort desktop screenshot into <paramref name="name"/> under the log directory,
+        /// for harness-level failures that happen outside a test (a bootstrap phase timing out, a
+        /// collection stalling). A modal dialog blocking Visual Studio is invisible in every other
+        /// artifact, so this is often the only evidence of what actually went wrong.
+        /// </summary>
+        internal static void TryCaptureScreenshot(string name)
+        {
+            try
+            {
+                var logDir = Path.GetFullPath(GetLogDirectory());
+                ScreenshotService.TakeScreenshot(Path.Combine(logDir, name, "_at_failure.png"));
+            }
+            catch
+            {
+                // Diagnostics only — never mask the failure being diagnosed.
+            }
+        }
+
         internal record struct CustomLoggerData(Action<string> Callback, string LogId, string Extension);
     }
 }

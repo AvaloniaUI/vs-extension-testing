@@ -381,7 +381,7 @@ namespace Xunit.Harness
                     // Capture what the desktop looked like before tearing the wedged IDE down: a
                     // modal dialog (crash prompt, licence prompt, first-run notice) blocking startup
                     // is invisible in every other artifact.
-                    TryTakeScreenshot($"dte-handshake-failure-{hostProcess.Id}");
+                    DataCollectionService.TryCaptureScreenshot($"dte-handshake-failure-{hostProcess.Id}");
                     IntegrationHelper.KillProcess(hostProcess);
 
                     DataCollectionService.RecordHarnessPhase("dte-handshake: relaunching devenv after failed handshake");
@@ -413,7 +413,7 @@ namespace Xunit.Harness
                 }
 
                 DataCollectionService.RecordHarnessPhase($"{phase}: TIMED OUT after {stopwatch.Elapsed:mm\\:ss} (limit {BootstrapPhaseTimeout.TotalMinutes:0.#}m)");
-                TryTakeScreenshot($"{phase}-timeout");
+                DataCollectionService.TryCaptureScreenshot($"{phase}-timeout");
                 IntegrationHelper.KillProcess(process);
 
                 if (attempt >= 2)
@@ -461,7 +461,7 @@ namespace Xunit.Harness
                 }
 
                 DataCollectionService.RecordHarnessPhase($"vsix-install: TIMED OUT installing '{extensionName}' after {stopwatch.Elapsed:mm\\:ss} (limit {BootstrapPhaseTimeout.TotalMinutes:0.#}m)");
-                TryTakeScreenshot("vsix-install-timeout");
+                DataCollectionService.TryCaptureScreenshot("vsix-install-timeout");
                 IntegrationHelper.KillProcess(installProcess);
 
                 // The abandoned readers complete (or fault) once the killed process's pipes close;
@@ -487,19 +487,6 @@ namespace Xunit.Harness
                 CancellationToken.None,
                 TaskContinuationOptions.OnlyOnFaulted,
                 TaskScheduler.Default);
-        }
-
-        private static void TryTakeScreenshot(string name)
-        {
-            try
-            {
-                var directory = Path.GetFullPath(DataCollectionService.GetLogDirectory());
-                ScreenshotService.TakeScreenshot(Path.Combine(directory, name, "_at_failure.png"));
-            }
-            catch
-            {
-                // Diagnostics only — never mask the failure being diagnosed.
-            }
         }
 
         private static async Task<Process> StartNewVisualStudioProcessAsync(string installationPath, Version version, string? rootSuffix, ImmutableDictionary<string, string> environmentVariables, ImmutableList<string> extensionFiles, string vsInstanceId)
