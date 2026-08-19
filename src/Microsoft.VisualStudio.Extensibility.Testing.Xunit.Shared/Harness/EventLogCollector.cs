@@ -275,12 +275,32 @@ namespace Xunit.Harness
                         dotNetEntriesStringBuilder.AppendLine();
                     }
 
+                    // Ensure that the directory exists before trying to write to it.
+                    var directory = Path.GetDirectoryName(filePath);
+                    if (!string.IsNullOrEmpty(directory))
+                    {
+                        Directory.CreateDirectory(directory);
+                    }
+
                     File.WriteAllText(filePath, dotNetEntriesStringBuilder.ToString());
                 }
             }
             catch (Exception ex)
             {
-                File.WriteAllText(filePath, ex.ToString());
+                try
+                {
+                    var directory = Path.GetDirectoryName(filePath);
+                    if (!string.IsNullOrEmpty(directory))
+                    {
+                        Directory.CreateDirectory(directory);
+                    }
+
+                    File.WriteAllText(filePath, ex.ToString());
+                }
+                catch
+                {
+                    // Swallow to avoid throwing from logging failure
+                }
             }
         }
 
