@@ -42,18 +42,29 @@ namespace Xunit.Harness
         /// no in-IDE guard can help — a per-test timeout enforced inside the IDE is wedged along
         /// with everything else there. The run then goes silent until vstest's blame collector
         /// aborts the whole test host, discarding the remaining tests and naming nothing.</para>
-        /// <para>Sized to sit between the two: comfortably above the longest legitimate silence
-        /// inside a collection (this repo's in-IDE per-sub-test ceiling is 5 minutes and the
-        /// slowest single observed test is ~2m40s), and below the 12-minute
-        /// <c>--blame-hang-timeout</c> the consuming build passes, so the harness gets to act
-        /// first. It cannot make a run fail that would otherwise have passed: a silence this long
-        /// was already going to be aborted 4 minutes later, just less usefully. If a collection
-        /// ever legitimately needs longer, this and the blame timeout must both rise.</para>
+        /// <para>Sized against the in-IDE per-sub-test ceiling, which is 5 minutes in this repo.
+        /// That guard is the one that produces a *named* failing test, so it must always win the
+        /// race: a sub-test that wedges is aborted at 5 minutes and the collection resumes
+        /// reporting, whereas this watchdog can only kill the IDE and force a whole retry. 6
+        /// minutes leaves the guard its full window plus a minute of slack, and stays below the
+        /// 12-minute <c>--blame-hang-timeout</c> the consuming build passes so the harness still
+        /// acts before vstest aborts the run anonymously.</para>
+        /// <para>The slack is genuinely sufficient: measured over a clean run (32741020461), the
+        /// slowest single test case is 35 seconds — the largest grouped scenario, which reports as
+        /// one case and so is the longest legitimate silence there is. The cost of waiting longer
+        /// is paid twice over on a bad run: each wedge burns this timeout before recovery even
+        /// begins. If the in-IDE ceiling rises, this must rise with it.</para>
         /// </remarks>
-        private static readonly TimeSpan StalledCollectionTimeout = TimeSpan.FromMinutes(8);
+        private static readonly TimeSpan StalledCollectionTimeout = TimeSpan.FromMinutes(6);
 
         /// <summary>How often the stall watchdog re-checks. Cheap; it only reads a timestamp.</summary>
         private static readonly TimeSpan StalledCollectionPollInterval = TimeSpan.FromSeconds(15);
+
+        /// <summary>
+        /// Ceiling on writing the pre-kill hang dump. Generous enough for a stacks-only dump of
+        /// devenv, small enough that a stuck capture only briefly delays releasing the blocked call.
+        /// </summary>
+        private static readonly TimeSpan HangDumpTimeout = TimeSpan.FromSeconds(90);
 
         private HashSet<VisualStudioInstanceKey>? _ideInstancesInTests;
 
@@ -540,7 +551,22 @@ namespace Xunit.Harness
                                 $"run-test-collection: STALLED — no test activity for {stalledFor:hh\\:mm\\:ss} " +
                                 $"(limit {StalledCollectionTimeout.TotalMinutes:0.#}m), in-flight test '{inFlight}'. " +
                                 $"Killing devenv (PID {hostProcess.Id}) to release the blocked call.");
-                            DataCollectionService.TryCaptureScreenshot($"run-test-collection-stall-{hostProcess.Id}");
+                            var captureName = $"run-test-collection-stall-{hostProcess.Id}";
+                            DataCollectionService.TryCaptureScreenshot(captureName);
+
+                            // Capture the thread stacks before killing: they are the only record of
+                            // what the UI thread was blocked on, and the kill destroys them. Bounded
+                            // on its own thread because writing a dump of devenv takes tens of
+                            // seconds and must never become the reason the blocked call isn't
+                            // released — on timeout we abandon the dump and kill anyway.
+                            var dumpThread = new Thread(() => DataCollectionService.TryCaptureHangDump(hostProcess, captureName))
+                            {
+                                IsBackground = true,
+                                Name = "Stall hang dump",
+                            };
+                            dumpThread.Start();
+                            dumpThread.Join(HangDumpTimeout);
+
                             IntegrationHelper.KillProcess(hostProcess);
                             return;
                         }

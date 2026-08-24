@@ -10,6 +10,7 @@ namespace Xunit.Harness
     using System.Linq;
     using System.Runtime.CompilerServices;
     using System.Runtime.ExceptionServices;
+    using System.Runtime.InteropServices;
     using Xunit.Abstractions;
     using Xunit.Sdk;
 
@@ -380,6 +381,106 @@ namespace Xunit.Harness
             catch
             {
                 // Diagnostics only — never mask the failure being diagnosed.
+            }
+        }
+
+        /// <summary>
+        /// Writes a minidump of <paramref name="process"/> alongside the other failure-state
+        /// captures, under the <paramref name="name"/> subdirectory.
+        /// </summary>
+        /// <remarks>
+        /// <para>Called before the stall watchdog kills a wedged IDE. A screenshot only shows that
+        /// the UI thread stopped responding; the thread stacks in a dump show what it stopped on,
+        /// and they cease to exist the moment the process is killed.</para>
+        /// <para>The dump deliberately excludes full memory. Thread stacks, thread state and the
+        /// handle table are enough to identify a blocking wait, and keep the file small enough to
+        /// upload as a CI artifact — <c>MiniDumpWithFullMemory</c> would also yield managed stacks
+        /// but produces a multi-gigabyte file for devenv on every stall.</para>
+        /// </remarks>
+        internal static void TryCaptureHangDump(Process process, string name)
+        {
+            string? dumpPath = null;
+            try
+            {
+                if (process is null || process.HasExited)
+                {
+                    return;
+                }
+
+                var dumpDirectory = Path.Combine(Path.GetFullPath(GetLogDirectory()), name);
+                Directory.CreateDirectory(dumpDirectory);
+                dumpPath = Path.Combine(dumpDirectory, $"devenv-{process.Id}.dmp");
+
+                // MiniDumpNormal (0x0) captures every thread's call stack — the point of the
+                // exercise. MiniDumpWithThreadInfo (0x1000) and MiniDumpWithHandleData (0x4) add
+                // thread state and the handle table, enough to identify what a blocked thread is
+                // waiting on, and all three together stay small enough to upload.
+                const uint dumpType = 0x0 | 0x1000 | 0x4;
+
+                bool written;
+                using (var stream = File.Create(dumpPath))
+                {
+                    written = MiniDumpWriteDump(
+                        process.Handle,
+                        (uint)process.Id,
+                        stream.SafeFileHandle,
+                        dumpType,
+                        IntPtr.Zero,
+                        IntPtr.Zero,
+                        IntPtr.Zero);
+                }
+
+                if (written)
+                {
+                    var sizeInMb = new FileInfo(dumpPath).Length / (1024 * 1024);
+                    RecordHarnessPhase($"hang-dump: wrote {name}\\devenv-{process.Id}.dmp ({sizeInMb} MB)");
+                }
+                else
+                {
+                    var error = Marshal.GetLastWin32Error();
+                    RecordHarnessPhase($"hang-dump: MiniDumpWriteDump failed for PID {process.Id} (Win32 error {error})");
+                    TryDeleteFile(dumpPath);
+                }
+            }
+            catch (Exception e)
+            {
+                RecordHarnessPhase($"hang-dump: could not capture a dump ({e.GetType().Name}: {e.Message})");
+                TryDeleteFile(dumpPath);
+            }
+        }
+
+        /// <summary>
+        /// Writes a minidump of a running process to <paramref name="hFile"/>.
+        /// </summary>
+        /// <remarks>
+        /// Declared by hand rather than generated through CsWin32, which rejects this API for an
+        /// AnyCPU assembly because its projection is architecture-specific (PInvoke005). The three
+        /// structure pointers are always null here, so nothing architecture-specific is marshalled.
+        /// </remarks>
+        [DllImport("dbghelp.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool MiniDumpWriteDump(
+            IntPtr hProcess,
+            uint processId,
+            SafeHandle hFile,
+            uint dumpType,
+            IntPtr exceptionParam,
+            IntPtr userStreamParam,
+            IntPtr callbackParam);
+
+        /// <summary>Removes a partially written dump so CI doesn't upload an unusable file.</summary>
+        private static void TryDeleteFile(string? path)
+        {
+            try
+            {
+                if (path is not null && File.Exists(path))
+                {
+                    File.Delete(path);
+                }
+            }
+            catch
+            {
+                // Best effort only.
             }
         }
 
