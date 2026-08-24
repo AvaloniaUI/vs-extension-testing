@@ -55,6 +55,12 @@ namespace Xunit.Harness
         /// <summary>How often the stall watchdog re-checks. Cheap; it only reads a timestamp.</summary>
         private static readonly TimeSpan StalledCollectionPollInterval = TimeSpan.FromSeconds(15);
 
+        /// <summary>
+        /// Ceiling on writing the pre-kill hang dump. Generous enough for a stacks-only dump of
+        /// devenv, small enough that a stuck capture only briefly delays releasing the blocked call.
+        /// </summary>
+        private static readonly TimeSpan HangDumpTimeout = TimeSpan.FromSeconds(90);
+
         private HashSet<VisualStudioInstanceKey>? _ideInstancesInTests;
 
         public IdeTestAssemblyRunner(ITestAssembly testAssembly, IEnumerable<IXunitTestCase> testCases, IMessageSink diagnosticMessageSink, IMessageSink executionMessageSink, ITestFrameworkExecutionOptions executionOptions)
@@ -540,7 +546,22 @@ namespace Xunit.Harness
                                 $"run-test-collection: STALLED — no test activity for {stalledFor:hh\\:mm\\:ss} " +
                                 $"(limit {StalledCollectionTimeout.TotalMinutes:0.#}m), in-flight test '{inFlight}'. " +
                                 $"Killing devenv (PID {hostProcess.Id}) to release the blocked call.");
-                            DataCollectionService.TryCaptureScreenshot($"run-test-collection-stall-{hostProcess.Id}");
+                            var captureName = $"run-test-collection-stall-{hostProcess.Id}";
+                            DataCollectionService.TryCaptureScreenshot(captureName);
+
+                            // Capture the thread stacks before killing: they are the only record of
+                            // what the UI thread was blocked on, and the kill destroys them. Bounded
+                            // on its own thread because writing a dump of devenv takes tens of
+                            // seconds and must never become the reason the blocked call isn't
+                            // released — on timeout we abandon the dump and kill anyway.
+                            var dumpThread = new Thread(() => DataCollectionService.TryCaptureHangDump(hostProcess, captureName))
+                            {
+                                IsBackground = true,
+                                Name = "Stall hang dump",
+                            };
+                            dumpThread.Start();
+                            dumpThread.Join(HangDumpTimeout);
+
                             IntegrationHelper.KillProcess(hostProcess);
                             return;
                         }
