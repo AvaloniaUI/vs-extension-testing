@@ -102,6 +102,23 @@ namespace Xunit.Harness
                     var currentInstance = testCasesByTargetVersion.Key;
                     var currentTests = testCasesByTargetVersion.ToArray();
 
+                    // Tests whose skip is already decided on the harness side (Skip= on the fact
+                    // attribute, or the target VS version not being installed) never need the IDE.
+                    // Report them from here and drop them from the batch, so a group consisting only
+                    // of skipped tests doesn't pay a multi-minute Visual Studio launch just to have
+                    // the in-IDE runner announce the skips. The group's key stays registered above so
+                    // the end-of-run IdeInstanceTestCase doesn't launch an instance for it either.
+                    var skippedTests = currentTests.Where(test => !string.IsNullOrEmpty(test.SkipReason)).ToArray();
+                    if (skippedTests.Length > 0)
+                    {
+                        result.Aggregate(ReportStaticallySkippedTests(skippedTests, completedTestCaseIds));
+                        currentTests = currentTests.Where(test => string.IsNullOrEmpty(test.SkipReason)).ToArray();
+                        if (currentTests.Length == 0)
+                        {
+                            continue;
+                        }
+                    }
+
                     for (var currentAttempt = 0; currentAttempt < testCasesByTargetVersion.Key.MaxAttempts; currentAttempt++)
                     {
                         // On retry attempts, exclude tests known to have crashed VS on a prior attempt - xUnit's
@@ -205,6 +222,30 @@ namespace Xunit.Harness
             }
 
             return result;
+        }
+
+        /// <summary>
+        /// Reports test cases whose <see cref="XunitTestCase.SkipReason"/> is already known on the
+        /// harness side without dispatching them to a Visual Studio instance. Only test-case-level
+        /// messages are emitted: class/method envelopes for the same classes are announced by the
+        /// VS-side run of their runnable siblings, and re-emitting those triggers "Key already
+        /// exists" failures in the VSTest adapter.
+        /// </summary>
+        private RunSummary ReportStaticallySkippedTests(IReadOnlyList<IdeTestCaseBase> testCases, HashSet<string> completedTestCaseIds)
+        {
+            var summary = new RunSummary { Total = testCases.Count, Skipped = testCases.Count };
+            foreach (var testCase in testCases)
+            {
+                var test = new XunitTest(testCase, testCase.DisplayName);
+                ExecutionMessageSink.OnMessage(new TestCaseStarting(testCase));
+                ExecutionMessageSink.OnMessage(new TestStarting(test));
+                ExecutionMessageSink.OnMessage(new TestSkipped(test, testCase.SkipReason));
+                ExecutionMessageSink.OnMessage(new TestFinished(test, 0, output: null));
+                ExecutionMessageSink.OnMessage(new TestCaseFinished(testCase, 0, testsRun: 1, testsFailed: 0, testsSkipped: 1));
+                completedTestCaseIds.Add(testCase.UniqueID);
+            }
+
+            return summary;
         }
 
         /// <param name="currentAttempt">The 0-based attempt number. If this value is
