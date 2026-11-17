@@ -114,6 +114,7 @@ namespace Xunit.Threading
         internal static string? GetSkipReasonIfNotInstalled(VisualStudioVersion visualStudioVersion)
         {
             int expectedMajorVersion;
+            int? expectedMinorVersion = null;
 
             switch (visualStudioVersion)
             {
@@ -145,21 +146,30 @@ namespace Xunit.Threading
                 expectedMajorVersion = 18;
                 break;
 
+            case VisualStudioVersion.VS18_11:
+                expectedMajorVersion = 18;
+                expectedMinorVersion = 11;
+                break;
+
             default:
                 throw new ArgumentException();
             }
 
+            var expectedVersion = expectedMinorVersion is { } minor
+                ? $"version {expectedMajorVersion}.{minor}"
+                : $"major version {expectedMajorVersion}";
             var sb = new StringBuilder();
 
             try
             {
                 var detected = VisualStudioInstanceFactory.EnumerateVisualStudioInstances().ToList();
-                if (detected.Any(i => i.Item2.Major == expectedMajorVersion))
+                if (detected.Any(i => i.Item2.Major == expectedMajorVersion
+                    && (expectedMinorVersion is null || i.Item2.Minor == expectedMinorVersion)))
                 {
                     return null;
                 }
 
-                sb.Append(visualStudioVersion).Append(" is not installed: no Visual Studio instance with major version ").Append(expectedMajorVersion).AppendLine(" was found by the Visual Studio Setup Configuration COM API.");
+                sb.Append(visualStudioVersion).Append(" is not installed: no Visual Studio instance with ").Append(expectedVersion).AppendLine(" was found by the Visual Studio Setup Configuration COM API.");
                 sb.AppendLine();
                 if (detected.Count == 0)
                 {
@@ -183,8 +193,8 @@ namespace Xunit.Threading
 
             sb.AppendLine();
             sb.AppendLine("To run these tests:");
-            sb.Append("  - Install a Visual Studio release with major version ").Append(expectedMajorVersion).Append(" (").Append(visualStudioVersion).AppendLine(") via the Visual Studio Installer.");
-            sb.AppendLine("  - Or set the VSInstallDir environment variable to the installation path of an installed VS instance with the required major version, then re-run the tests.");
+            sb.Append("  - Install a Visual Studio release with ").Append(expectedVersion).Append(" (").Append(visualStudioVersion).AppendLine(") via the Visual Studio Installer.");
+            sb.AppendLine("  - Or set the VSInstallDir environment variable to the installation path of an installed VS instance with the required version, then re-run the tests.");
             sb.AppendLine("  - Verify what the Setup Configuration COM API reports by running:");
             sb.AppendLine("      \"%ProgramFiles(x86)%\\Microsoft Visual Studio\\Installer\\vswhere.exe\" -all -prerelease -format json");
 
