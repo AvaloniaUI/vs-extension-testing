@@ -388,7 +388,7 @@ namespace Xunit.Harness
                     // can never wedge on a dead-but-not-faulted IPC channel.
                     using (var messageFilter = new MessageFilter())
                     {
-                        var visualStudioContext = await visualStudioInstanceFactory.GetNewOrUsedInstanceAsync(GetVersion(visualStudioInstanceKey.Version), visualStudioInstanceKey.RootSuffix, environmentVariables, GetExtensionFiles(testCases), ImmutableHashSet.Create<string>()).ConfigureAwait(true);
+                        var visualStudioContext = await visualStudioInstanceFactory.GetNewOrUsedInstanceAsync(GetVersion(visualStudioInstanceKey.Version), visualStudioInstanceKey.RootSuffix, environmentVariables, GetExtensionFiles(testCases, visualStudioInstanceKey.Version), ImmutableHashSet.Create<string>()).ConfigureAwait(true);
                         try
                         {
                             var runner = visualStudioContext.Instance.TestInvoker.CreateTestAssemblyRunner(new IpcTestAssembly(TestAssembly), testCases.ToArray(), new IpcMessageSink(DiagnosticMessageSink, knownTestCasesByUniqueId, finalAttempt, new HashSet<string>(), cancellationTokenSource.Token), executionMessageSinkFilter, new IpcTestFrameworkExecutionOptions(ExecutionOptions));
@@ -679,7 +679,7 @@ namespace Xunit.Harness
             return sb.ToString().TrimEnd();
         }
 
-        private ImmutableList<string> GetExtensionFiles(IEnumerable<IXunitTestCase> testCases)
+        private ImmutableList<string> GetExtensionFiles(IEnumerable<IXunitTestCase> testCases, VisualStudioVersion version)
         {
             var extensionFiles = ImmutableHashSet.Create<string>(StringComparer.OrdinalIgnoreCase);
             var visited = new HashSet<IAssemblyInfo>();
@@ -692,10 +692,23 @@ namespace Xunit.Harness
                 }
 
                 var requiredExtensions = assemblyInfo.GetCustomAttributes(typeof(RequireExtensionAttribute));
-                extensionFiles = extensionFiles.Union(requiredExtensions.Select(attributeInfo => attributeInfo.GetConstructorArguments().First().ToString()));
+                extensionFiles = extensionFiles.Union(
+                    requiredExtensions
+                        .Select(attributeInfo => attributeInfo.GetConstructorArguments().ToArray())
+                        .Where(arguments => IsRequiredForVersion(arguments, version))
+                        .Select(arguments => arguments[0].ToString()));
             }
 
             return extensionFiles.ToImmutableList();
+        }
+
+        private static bool IsRequiredForVersion(object[] constructorArguments, VisualStudioVersion version)
+        {
+            // Reflection can report an enum argument as its underlying integer.
+            var requiredVersion = constructorArguments.Length > 1
+                ? (VisualStudioVersion)Convert.ToInt32(constructorArguments[1])
+                : VisualStudioVersion.Unspecified;
+            return requiredVersion == VisualStudioVersion.Unspecified || requiredVersion == version;
         }
 
         private static Version GetVersion(VisualStudioVersion visualStudioVersion)
@@ -722,6 +735,9 @@ namespace Xunit.Harness
 
             case VisualStudioVersion.VS18:
                 return new Version(18, 0);
+
+            case VisualStudioVersion.VS18_11:
+                return new Version(18, 11);
 
             default:
                 throw new ArgumentException();

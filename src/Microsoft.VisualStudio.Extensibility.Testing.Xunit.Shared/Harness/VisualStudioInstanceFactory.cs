@@ -153,9 +153,58 @@ namespace Xunit.Harness
             //  * The current instance does not support all the required packages -or-
             //  * The current instance is no longer running
             return _currentlyRunningInstance == null
-                || _currentlyRunningInstance.Version.Major != version.Major
+                || !IsInstallForVersion(_currentlyRunningInstance.InstallationPath, version, requiredPackageIds)
                 || (!requiredPackageIds.All(id => _currentlyRunningInstance.SupportedPackageIds.Contains(id)))
                 || !_currentlyRunningInstance.IsRunning;
+        }
+
+        /// <summary>
+        /// Returns whether <paramref name="installationPath"/> is the install a new instance for
+        /// <paramref name="version"/> would use. Several installs can share a major version.
+        /// </summary>
+        private static bool IsInstallForVersion(string installationPath, Version version, ImmutableHashSet<string> requiredPackageIds)
+        {
+            try
+            {
+                var expected = LocateVisualStudioInstance(version, requiredPackageIds).Item1;
+                return NormalizeInstallationPath(expected).Equals(NormalizeInstallationPath(installationPath), StringComparison.OrdinalIgnoreCase);
+            }
+            catch (PlatformNotSupportedException)
+            {
+                // Starting a new instance reports the missing install.
+                return false;
+            }
+        }
+
+        private static string NormalizeInstallationPath(string path)
+        {
+            return Path.GetFullPath(path).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        }
+
+        /// <summary>
+        /// Returns whether an install with version <paramref name="installed"/> can run tests that
+        /// request <paramref name="requested"/>. A requested version with a non-zero minor version
+        /// (for example 18.11) only matches installs with that minor version.
+        /// </summary>
+        internal static bool SatisfiesVersion(Version installed, Version requested)
+        {
+            return installed.Major == requested.Major
+                && installed >= requested
+                && (requested.Minor == 0 || installed.Minor == requested.Minor);
+        }
+
+        private static ImmutableHashSet<string> GetPrereleaseInstallationPaths()
+        {
+            var paths = ImmutableHashSet.CreateBuilder<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var instance in EnumerateVisualStudioInstancesViaInstaller())
+            {
+                if (instance is ISetupInstanceCatalog catalog && catalog.IsPrerelease())
+                {
+                    paths.Add(NormalizeInstallationPath(instance.GetInstallationPath()));
+                }
+            }
+
+            return paths.ToImmutable();
         }
 
         private void ThrowExceptionIfAlreadyHasActiveContext()
@@ -303,7 +352,7 @@ namespace Xunit.Harness
                     return installationPath.Equals(vsInstallDir, StringComparison.OrdinalIgnoreCase);
                 });
 
-                if (candidateInstance == null || candidateInstance.Item2.Major != version.Major)
+                if (candidateInstance == null || !SatisfiesVersion(candidateInstance.Item2, version))
                 {
                     vsInstallDir = null;
                     haveVsInstallDir = false;
@@ -314,12 +363,14 @@ namespace Xunit.Harness
                 }
             }
 
+            // Prefer release-channel installs, then the newest version, as `vswhere -latest` does.
+            // The build deploys the extension under test to that install.
+            var prereleasePaths = GetPrereleaseInstallationPaths();
             var instances = EnumerateVisualStudioInstances().Where((instance) =>
             {
                 var isMatch = true;
                 {
-                    isMatch &= version.Major == instance.Item2.Major;
-                    isMatch &= instance.Item2 >= version;
+                    isMatch &= SatisfiesVersion(instance.Item2, version);
 
                     if (haveVsInstallDir && version.Major >= 15)
                     {
@@ -331,7 +382,9 @@ namespace Xunit.Harness
                 }
 
                 return isMatch;
-            });
+            })
+            .OrderBy(instance => prereleasePaths.Contains(NormalizeInstallationPath(instance.Item1)))
+            .ThenByDescending(instance => instance.Item2);
 
             var instanceFoundWithInvalidState = false;
 
@@ -766,7 +819,7 @@ namespace Xunit.Harness
             // Run the snapshot collection operation, but don't block on its completion for the actual test execution
             StartPeriodicScreenshotsUntilExit(process, $"devenv{process.Id}");
 
-            DataCollectionService.RecordHarnessPhase($"devenv-launch: launched Visual Studio (PID {process.Id})");
+            DataCollectionService.RecordHarnessPhase($"devenv-launch: launched Visual Studio from '{installationPath}' (PID {process.Id})");
 
             return process;
 
